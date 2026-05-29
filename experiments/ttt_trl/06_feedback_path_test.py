@@ -87,11 +87,24 @@ def build_privileged_context(row: dict, max_cases: int = 5, max_len: int = 200) 
     Uses PUBLIC test cases only (private tests stay for reward scoring -> no leak).
     The student gets no hint; the teacher sees these expected I/O pairs.
     """
+    import json
+
     pts = row.get("public_test_cases") or []
-    if not pts:
+    # Raw LCBv6 rows store this as a JSON string; parse if needed.
+    if isinstance(pts, str):
+        pts = pts.strip()
+        if not pts:
+            return ""
+        try:
+            pts = json.loads(pts)
+        except Exception:
+            return f"Reference (public tests):\n{pts[:max_len * max_cases]}"
+    if not isinstance(pts, list) or not pts:
         return ""
     lines = ["Your solution must satisfy these test cases:"]
     for t in pts[:max_cases]:
+        if not isinstance(t, dict):
+            continue
         inp = str(t.get("input", ""))[:max_len]
         out = str(t.get("output", ""))[:max_len]
         lines.append(f"- Input: {inp}  ->  Expected: {out}")
