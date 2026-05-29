@@ -1,0 +1,25 @@
+# Extra dependencies needed on Google Colab (L4) for 05_colab_qwen15b_kickoff.py
+# Colab base image already ships torch/transformers; these are the gaps found 2026-05-29.
+#
+# Install with:
+#   pip install -q -r experiments/ttt_trl/colab/requirements_colab.txt
+#
+# Notes:
+# - torchao>=0.16.0 REQUIRED: Colab default 0.10.0 is rejected by transformers/trl
+#   (error: "Found an incompatible version of torchao ... only versions above 0.16.0").
+# - ray/tensordict/omegaconf/hydra-core: pulled in transitively by `verl` import chain
+#   (evaluator.py -> verl.utils.reward_score.feedback.code).
+# - pylatexenc: needed by verl reward/code path.
+
+trl>=0.12
+peft
+accelerate
+datasets
+bitsandbytes
+wandb
+ray
+tensordict
+omegaconf
+hydra-core
+pylatexenc
+torchao>=0.16.0
