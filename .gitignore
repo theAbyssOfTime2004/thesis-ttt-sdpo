@@ -133,3 +133,35 @@ outputs
 other_implementation
 Dockerfile.gh200-ofi
 DOCKER_PLAN_GH200.md
+
+
+# Thesis - POC artifacts
+
+experiments/ttt_trl/outputs/
+
+experiments/*/outputs/
+
+*.log
+
+dummy_log.txt
+
+wandb/
+
+
+
+# Local-only experiment outputs
+
+multiturn-*-local.jsonl
+
+multiturn-*.jsonl
+
+
+
+# Env / secrets
+
+.env
+
+.gh_token
+
+*.token
+

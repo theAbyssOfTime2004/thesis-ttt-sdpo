@@ -10,11 +10,10 @@ from datasets import load_dataset
 import wandb
 from vllm import LLM, SamplingParams
 from verl.utils import hf_tokenizer
-from verl.utils.reward_score import multi_source_reward
+from verl.utils.reward_score.feedback import code as code_reward
 
-
-MODEL = "Qwen/Qwen3-8B"
-MAX_TOKENS = 8192
+MODEL = "Qwen/Qwen3-8B" # TODO: change to Qwen3-32B
+MAX_TOKENS = 8192 # TODO: change to 32768
 TEMPERATURE = 1.0
 TOP_P = 1
 TOP_K = -1
@@ -200,13 +199,12 @@ def run_question(
         response_length = _token_length(tokenizer, response)
 
         # compute reward
-        score = multi_source_reward.compute_score(
+        score = code_reward.compute_score(
             solution=response,
             ground_truth=question.tests,
-            reward_style="code",
             extra_info={"split": question.split, "truncated": False},
-            max_test_cases=max_test_cases,
             sparse_rewards=True,
+            max_test_cases=max_test_cases,
         )
 
         reward = float(score.get("score", 0.0))
