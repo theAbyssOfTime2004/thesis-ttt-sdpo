@@ -220,6 +220,7 @@ def _build_sdpo_config(
     max_steps: int,
     max_new_tokens: int,
     seed: int,
+    policy_loss_mode: str = "hybrid",
     report_to: str = "none",
 ) -> SDPOConfig:
     requested = {
@@ -237,7 +238,9 @@ def _build_sdpo_config(
         "distillation_topk": 20,
         "full_logit_distillation": True,
         "distillation_alpha": 1.0,
-        "sdpo_policy_loss_mode": "distillation_only",
+        # hybrid = GRPO policy term (reinforces high-reward rollouts directly)
+        # + distillation. distillation_only had no direct success reinforcement.
+        "sdpo_policy_loss_mode": policy_loss_mode,
         # Feedback path (Path B): teacher gets the public-test hint.
         "include_environment_feedback": True,
         "environment_feedback_only_without_solution": True,
@@ -284,6 +287,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--eval_samples", type=int, default=8, help="Samples for pre/post eval.")
+    parser.add_argument("--policy_loss_mode", type=str, default="hybrid",
+                        choices=["hybrid", "distillation_only"],
+                        help="hybrid adds GRPO policy term that reinforces successes.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="outputs/07_discovery_curve")
     parser.add_argument("--wandb_project", type=str, default="ttt-sdpo-thesis")
@@ -312,7 +318,7 @@ def main() -> None:
 
         wandb.init(
             project=args.wandb_project,
-            name=f"discovery-{args.model_name.split('/')[-1]}-idx{args.problem_index}-{args.max_steps}step",
+            name=f"discovery-{args.model_name.split('/')[-1]}-idx{args.problem_index}-{args.max_steps}step-{args.policy_loss_mode}",
             config=vars(args),
         )
 
@@ -367,6 +373,7 @@ def main() -> None:
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         seed=args.seed,
+        policy_loss_mode=args.policy_loss_mode,
         report_to=report_to,
     )
 
