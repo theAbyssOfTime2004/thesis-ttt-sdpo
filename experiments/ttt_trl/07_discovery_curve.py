@@ -233,7 +233,8 @@ def _build_sdpo_config(
         "learning_rate": 1e-5,
         "temperature": 1.0,
         "max_completion_length": max_new_tokens,
-        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 30.0},
+        # max_time bumped: Qwen3 thinking needs more wall-clock per generation.
+        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 90.0},
         "gradient_checkpointing": True,
         "distillation_topk": 20,
         "full_logit_distillation": True,
@@ -283,9 +284,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--problem_index", type=int, default=0, help="LCBv6 index (0=abc387_b).")
     parser.add_argument("--max_steps", type=int, default=15, help="TTT steps on the single problem.")
     parser.add_argument("--num_generations", type=int, default=4)
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--lora_r", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=2048,
+                        help="Higher for Qwen3 thinking mode (think tokens + code).")
     parser.add_argument("--eval_samples", type=int, default=8, help="Samples for pre/post eval.")
     parser.add_argument("--policy_loss_mode", type=str, default="hybrid",
                         choices=["hybrid", "distillation_only"],
