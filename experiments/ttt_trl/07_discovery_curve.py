@@ -63,7 +63,7 @@ def _extract_text(completion: Any) -> str:
     return str(completion)
 
 
-def _prepare_tokenizer(model_name: str):
+def _prepare_tokenizer(model_name: str, thinking: bool = False):
     # Some repos do not expose `additional_chat_templates/`; treat it as optional.
     original_list_repo_templates = hub_utils.list_repo_templates
 
@@ -75,7 +75,27 @@ def _prepare_tokenizer(model_name: str):
 
     hub_utils.list_repo_templates = _safe_list_repo_templates
     tokenization_utils_base.list_repo_templates = _safe_list_repo_templates
-    return AutoTokenizer.from_pretrained(model_name)
+    tok = AutoTokenizer.from_pretrained(model_name)
+
+    if not thinking:
+        # Qwen3 enables thinking by default -> long <think> blocks eat the token
+        # budget and the model never emits a ```python``` block, so code extraction
+        # fails and reward is always 0. Force enable_thinking=False everywhere
+        # (both the trainer's internal prompt rendering and our eval). Harmless for
+        # tokenizers whose template doesn't accept the kwarg (TypeError -> retry).
+        _orig_apply = tok.apply_chat_template
+
+        def _no_think_apply(*a, **kw):
+            kw.setdefault("enable_thinking", False)
+            try:
+                return _orig_apply(*a, **kw)
+            except TypeError:
+                kw.pop("enable_thinking", None)
+                return _orig_apply(*a, **kw)
+
+        tok.apply_chat_template = _no_think_apply
+
+    return tok
 
 
 def _build_messages(question_content: str) -> list[dict[str, str]]:
@@ -233,8 +253,7 @@ def _build_sdpo_config(
         "learning_rate": 1e-5,
         "temperature": 1.0,
         "max_completion_length": max_new_tokens,
-        # max_time bumped: Qwen3 thinking needs more wall-clock per generation.
-        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 90.0},
+        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 60.0},
         "gradient_checkpointing": True,
         "distillation_topk": 20,
         "full_logit_distillation": True,
@@ -286,8 +305,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_generations", type=int, default=4)
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--lora_r", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=2048,
-                        help="Higher for Qwen3 thinking mode (think tokens + code).")
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--thinking", action="store_true",
+                        help="Enable Qwen3 thinking mode (default off; needs much higher max_new_tokens).")
     parser.add_argument("--eval_samples", type=int, default=8, help="Samples for pre/post eval.")
     parser.add_argument("--policy_loss_mode", type=str, default="hybrid",
                         choices=["hybrid", "distillation_only"],
@@ -334,7 +354,8 @@ def main() -> None:
     question_content = str(row.get("question_content", ""))
     print(f"\n=== PROBLEM idx {args.problem_index}: {problem_id} ({difficulty}) ===")
 
-    tokenizer = _prepare_tokenizer(args.model_name)
+    tokenizer = _prepare_tokenizer(args.model_name, thinking=args.thinking)
+    print(f"Thinking mode: {args.thinking}")
     lora_config = _build_lora_config(args.lora_r)
 
     total_start = time.time()
