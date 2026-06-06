@@ -189,7 +189,13 @@ def evaluate_model(
             sc = _score(code)
             scores.append(sc)
             if i == 0:
-                print(f"[eval-debug] sample[0] len={len(code)} chars score={sc:.3f}; first 400:\n{code[:400]}\n[eval-debug] last 150:\n{code[-150:]}\n[eval-debug]---")
+                # Print the FULL completion so we can read it directly and judge
+                # whether it contains code (fenced OR raw) — counting fences is a
+                # proxy that misses unfenced code.
+                print(f"[eval-debug] sample[0] len={len(code)} chars score={sc:.3f}")
+                print("[eval-debug] FULL COMPLETION BELOW >>>>>>>>>>")
+                print(code)
+                print("[eval-debug] <<<<<<<<<< END FULL COMPLETION")
 
     # Greedy solution (deterministic reference).
     g = model.generate(
