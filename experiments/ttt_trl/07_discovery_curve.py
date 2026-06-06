@@ -186,7 +186,10 @@ def evaluate_model(
         )
         for i in range(out.shape[0]):
             code = tokenizer.decode(out[i, prompt_len:], skip_special_tokens=True)
-            scores.append(_score(code))
+            sc = _score(code)
+            scores.append(sc)
+            if i == 0:
+                print(f"[eval-debug] sample[0] len={len(code)} chars score={sc:.3f}; first 400:\n{code[:400]}\n[eval-debug] last 150:\n{code[-150:]}\n[eval-debug]---")
 
     # Greedy solution (deterministic reference).
     g = model.generate(
