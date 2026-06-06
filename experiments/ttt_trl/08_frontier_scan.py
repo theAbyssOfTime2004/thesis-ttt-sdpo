@@ -62,8 +62,14 @@ def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens) -> dict:
     device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     question_content = str(row.get("question_content", ""))
+    # Match 07's directive so scan pass-rates are consistent with the TTT runs.
+    directive = (
+        "\n\nRespond with ONLY the complete Python solution inside a single "
+        "```python ... ``` block. Do not explain. Read input from stdin, print to stdout."
+    )
     prompt_text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": question_content}], add_generation_prompt=True, tokenize=False
+        [{"role": "user", "content": question_content + directive}],
+        add_generation_prompt=True, tokenize=False,
     )
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[1]
