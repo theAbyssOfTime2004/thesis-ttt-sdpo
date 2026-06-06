@@ -453,6 +453,16 @@ def main() -> None:
     }
     trainer = SDPOTrainer(**_filter_supported_kwargs(SDPOTrainer, trainer_kwargs))
 
+    # DIAGNOSTIC: dump the exact prompt the trainer will feed to generation.
+    try:
+        td = trainer.train_dataset
+        row0 = td[0]
+        print(f"[diag] trainer.train_dataset[0] keys: {list(row0.keys())}")
+        pv = row0.get("prompt")
+        print(f"[diag] prompt type={type(pv).__name__}; repr first 500:\n{repr(pv)[:500]}")
+    except Exception as exc:
+        print(f"[diag] could not inspect train_dataset: {exc}")
+
     print(f"\n[TTT] training {args.max_steps} steps on {problem_id} ...")
     run_start = time.time()
     trainer.train()
