@@ -99,7 +99,13 @@ def _prepare_tokenizer(model_name: str, thinking: bool = False):
 
 
 def _build_messages(question_content: str) -> list[dict[str, str]]:
-    return [{"role": "user", "content": question_content}]
+    # Force a code-first answer: the model otherwise rambles for the whole token
+    # budget and never emits a ```python``` block -> reward 0 during training.
+    directive = (
+        "\n\nRespond with ONLY the complete Python solution inside a single "
+        "```python ... ``` block. Do not explain. Read input from stdin, print to stdout."
+    )
+    return [{"role": "user", "content": question_content + directive}]
 
 
 def build_privileged_context(row: dict, max_cases: int = 5, max_len: int = 200) -> str:
