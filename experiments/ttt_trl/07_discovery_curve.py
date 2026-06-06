@@ -394,8 +394,12 @@ def main() -> None:
     privileged_context = build_privileged_context(row)
     print(f"Privileged context ({len(privileged_context)} chars): "
           f"{privileged_context[:160].replace(chr(10), ' ')}")
+    # Pass the PRE-RENDERED thinking-off prompt string (not messages). The trainer
+    # re-applies the chat template to message-format prompts and that path bypassed
+    # our thinking-off patch -> training rollouts were long reasoning, truncated, no
+    # code, reward 0. A pre-rendered string is used as-is -> matches eval (thinking off).
     train_dataset = Dataset.from_dict(
-        {"prompt": [_build_messages(question_content)], "privileged_context": [privileged_context]}
+        {"prompt": [rendered], "privileged_context": [privileged_context]}
     )
 
     problem_dir = output_root / f"problem_{args.problem_index:02d}_{problem_id}"
