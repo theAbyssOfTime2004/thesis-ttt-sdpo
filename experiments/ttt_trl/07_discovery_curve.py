@@ -246,6 +246,7 @@ def _build_sdpo_config(
     max_steps: int,
     max_new_tokens: int,
     seed: int,
+    temperature: float = 1.0,
     policy_loss_mode: str = "hybrid",
     report_to: str = "none",
 ) -> SDPOConfig:
@@ -257,7 +258,7 @@ def _build_sdpo_config(
         "num_generations": num_generations,
         "max_steps": max_steps,
         "learning_rate": 1e-5,
-        "temperature": 1.0,
+        "temperature": temperature,
         "max_completion_length": max_new_tokens,
         "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 300.0},
         # Thinking-off must reach the TRAINER's internal rendering, not just our
@@ -327,6 +328,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy_loss_mode", type=str, default="hybrid",
                         choices=["hybrid", "distillation_only"],
                         help="hybrid adds GRPO policy term that reinforces successes.")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Training sampling temp. Lower (0.7) curbs rambling -> more code.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="outputs/07_discovery_curve")
     parser.add_argument("--wandb_project", type=str, default="ttt-sdpo-thesis")
@@ -415,6 +418,7 @@ def main() -> None:
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         seed=args.seed,
+        temperature=args.temperature,
         policy_loss_mode=args.policy_loss_mode,
         report_to=report_to,
     )

@@ -98,7 +98,8 @@ def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Scan LCBv6 for frontier problems (one-shot pass rate in (0,1)).")
     p.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
-    p.add_argument("--num_problems", type=int, default=40, help="How many LCBv6 problems to scan from index 0.")
+    p.add_argument("--start", type=int, default=0, help="First LCBv6 index to scan.")
+    p.add_argument("--num_problems", type=int, default=40, help="How many problems to scan from --start.")
     p.add_argument("--n_samples", type=int, default=4)
     p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--thinking", action="store_true")
@@ -118,7 +119,8 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     lcb = load_lcbv6_split()
-    n = min(args.num_problems, len(lcb))
+    start = max(0, min(args.start, len(lcb)))
+    end = min(start + args.num_problems, len(lcb))
     tokenizer = _prepare_tokenizer(args.model_name, thinking=args.thinking)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16, device_map="cuda"
@@ -126,9 +128,9 @@ def main() -> None:
     model.eval()
 
     results = []
-    print(f"\nScanning {n} problems with {args.n_samples} samples each ...\n")
+    print(f"\nScanning problems [{start}, {end}) with {args.n_samples} samples each ...\n")
     print("idx | problem_id | difficulty | pass_rate | mean | frontier?")
-    for idx in range(n):
+    for idx in range(start, end):
         row = lcb[idx]
         pid = row.get("question_id", row.get("problem_id", f"idx_{idx}"))
         diff = row.get("difficulty", "?")
