@@ -253,7 +253,16 @@ def _build_sdpo_config(
         "learning_rate": 1e-5,
         "temperature": 1.0,
         "max_completion_length": max_new_tokens,
-        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 60.0},
+        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 300.0},
+        # Thinking-off must reach the TRAINER's internal rendering, not just our
+        # eval. The monkey-patch on tok.apply_chat_template did NOT propagate to
+        # the student-rollout prompt (GRPOTrainer renders via the trl
+        # data_utils.apply_chat_template wrapper with **chat_template_kwargs).
+        # This is the official, supported channel -> covers student rollout
+        # (grpo_trainer line 1951) AND teacher reprompt tokenization. Without it
+        # Qwen3 emits <think> blocks, blows the token budget, never produces a
+        # ```python``` block -> every training rollout scores 0 (the artifact).
+        "chat_template_kwargs": {"enable_thinking": False},
         "gradient_checkpointing": True,
         "distillation_topk": 20,
         "full_logit_distillation": True,
@@ -403,6 +412,9 @@ def main() -> None:
     reward_history: list[list[float]] = []
 
     def reward_fn(completions, prompts=None, **kwargs):
+        if not reward_history:  # first step only: inspect what training actually generated
+            dbg = _extract_text(completions[0])
+            print(f"[debug] step1 completion[0] len={len(dbg)} chars; first 400:\n{dbg[:400]}\n[debug] last 150:\n{dbg[-150:]}\n[debug]---")
         rewards = []
         for completion in completions:
             code = _extract_text(completion)
