@@ -138,6 +138,30 @@ def build_privileged_context(row: dict, max_cases: int = 5, max_len: int = 200) 
     return "\n".join(lines)
 
 
+def build_dynamic_feedback(solution_code: str, row: dict, max_len: int = 1500) -> str:
+    """
+    REAL environment feedback (Phase 2b): run the model's own attempt through the
+    evaluator and return the evaluator's feedback text (which can reveal failure
+    modes invisible to public-test hints, e.g. timeouts on large hidden tests).
+    This is the verl rich-feedback path (same one baseline multiturn.py consumed).
+    """
+    if not solution_code.strip():
+        return ""
+    try:
+        out = evaluate_solution(solution_code, row, split="train")
+    except Exception as exc:
+        print(f"[dyn-feedback] evaluation failed: {exc}")
+        return ""
+    fb = ""
+    det = out.get("details")
+    if isinstance(det, dict):
+        fb = str(det.get("feedback", "") or "")
+    if not fb:
+        fb = (f"Your earlier attempt passed {out.get('n_passed')}/{out.get('n_total')} "
+              f"hidden tests (score {out.get('score'):.2f}). It is not fully correct.")
+    return "Result of running your earlier attempt:\n" + fb[:max_len]
+
+
 @torch.no_grad()
 def evaluate_model(
     model,
@@ -219,6 +243,7 @@ def evaluate_model(
         "max_score": max(scores) if scores else 0.0,
         "pass_rate": pass_rate,
         "greedy_score": greedy_score,
+        "greedy_code": greedy_code,
     }
 
 
@@ -235,6 +260,7 @@ def safe_evaluate_model(model, tokenizer, row, n_samples, max_new_tokens, label=
             "max_score": 0.0,
             "pass_rate": 0.0,
             "greedy_score": 0.0,
+            "greedy_code": "",
             "error": str(exc),
         }
 
@@ -343,6 +369,9 @@ def parse_args() -> argparse.Namespace:
                         help="hybrid adds GRPO policy term that reinforces successes.")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Training sampling temp. Lower (0.7) curbs rambling -> more code.")
+    parser.add_argument("--dynamic_feedback", action="store_true",
+                        help="Append REAL evaluator feedback on the model's own greedy attempt "
+                             "to privileged_context (Phase 2b) instead of static public-test hint only.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="outputs/07_discovery_curve")
     parser.add_argument("--wandb_project", type=str, default="ttt-sdpo-thesis")
@@ -414,8 +443,12 @@ def main() -> None:
           f"greedy={pre_eval['greedy_score']:.3f} scores={pre_eval['scores']}")
 
     privileged_context = build_privileged_context(row)
+    if args.dynamic_feedback:
+        dyn = build_dynamic_feedback(pre_eval.get("greedy_code", ""), row)
+        if dyn:
+            privileged_context = (privileged_context + "\n\n" + dyn).strip()
     print(f"Privileged context ({len(privileged_context)} chars): "
-          f"{privileged_context[:160].replace(chr(10), ' ')}")
+          f"{privileged_context[:400].replace(chr(10), ' ')}")
     # Use MESSAGES (conversational) format. The trainer renders the chat template
     # itself with chat_template_kwargs={"enable_thinking": False} (set in config) ->
     # official channel: thinking off AND a proper assistant turn. The pre-rendered
