@@ -412,12 +412,13 @@ def main() -> None:
     privileged_context = build_privileged_context(row)
     print(f"Privileged context ({len(privileged_context)} chars): "
           f"{privileged_context[:160].replace(chr(10), ' ')}")
-    # Pass the PRE-RENDERED thinking-off prompt string (not messages). The trainer
-    # re-applies the chat template to message-format prompts and that path bypassed
-    # our thinking-off patch -> training rollouts were long reasoning, truncated, no
-    # code, reward 0. A pre-rendered string is used as-is -> matches eval (thinking off).
+    # Use MESSAGES (conversational) format. The trainer renders the chat template
+    # itself with chat_template_kwargs={"enable_thinking": False} (set in config) ->
+    # official channel: thinking off AND a proper assistant turn. The pre-rendered
+    # string approach made training rollouts continue the user text (" below:...")
+    # instead of starting a fresh ```python answer like eval does.
     train_dataset = Dataset.from_dict(
-        {"prompt": [rendered], "privileged_context": [privileged_context]}
+        {"prompt": [_build_messages(question_content)], "privileged_context": [privileged_context]}
     )
 
     problem_dir = output_root / f"problem_{args.problem_index:02d}_{problem_id}"
@@ -472,7 +473,9 @@ def main() -> None:
         row0 = td[0]
         print(f"[diag] trainer.train_dataset[0] keys: {list(row0.keys())}")
         pv = row0.get("prompt")
-        print(f"[diag] prompt type={type(pv).__name__}; repr first 500:\n{repr(pv)[:500]}")
+        print(f"[diag] prompt type={type(pv).__name__} len={len(pv) if hasattr(pv,'__len__') else '?'}")
+        print(f"[diag] prompt FIRST 300:\n{repr(pv)[:300]}")
+        print(f"[diag] prompt LAST 400 (directive + assistant turn should be here):\n{repr(pv)[-400:]}")
     except Exception as exc:
         print(f"[diag] could not inspect train_dataset: {exc}")
 
