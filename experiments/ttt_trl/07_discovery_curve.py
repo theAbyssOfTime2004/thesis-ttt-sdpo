@@ -269,6 +269,10 @@ def _build_sdpo_config(
         "learning_rate": 1e-5,
         "temperature": temperature,
         "max_completion_length": max_new_tokens,
+        # TRL default max_prompt_length=512 TOKENS silently truncates long problem
+        # statements (grid problems!) -> model continues the cut-off text instead
+        # of answering -> rambling rollouts, reward 0. Long problems need room.
+        "max_prompt_length": 4096,
         "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 300.0},
         # Thinking-off must reach the TRAINER's internal rendering, not just our
         # eval. The monkey-patch on tok.apply_chat_template did NOT propagate to
@@ -479,6 +483,10 @@ def main() -> None:
         print(f"[diag] prompt type={type(pv).__name__} len={len(pv) if hasattr(pv,'__len__') else '?'}")
         print(f"[diag] prompt FIRST 300:\n{repr(pv)[:300]}")
         print(f"[diag] prompt LAST 400 (directive + assistant turn should be here):\n{repr(pv)[-400:]}")
+        tok_len = len(tokenizer(rendered)["input_ids"])
+        print(f"[diag] rendered prompt TOKEN count = {tok_len}; "
+              f"trainer.max_prompt_length = {getattr(trainer, 'max_prompt_length', '?')}"
+              f"  (tokens > limit -> truncation -> rambling)")
     except Exception as exc:
         print(f"[diag] could not inspect train_dataset: {exc}")
 
