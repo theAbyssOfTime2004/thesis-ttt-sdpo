@@ -437,6 +437,9 @@ def main() -> None:
 
     def reward_fn(completions, prompts=None, **kwargs):
         if not reward_history:  # first step only: inspect what training actually generated
+            if prompts is not None and len(prompts) > 0:
+                ptxt = _extract_text(prompts[0])
+                print(f"[debug] TRAINER PROMPT[0] len={len(ptxt)}; LAST 600 (the part right before generation):\n{repr(ptxt[-600:])}\n[debug]===")
             dbg = _extract_text(completions[0])
             print(f"[debug] step1 completion[0] len={len(dbg)} chars; first 400:\n{dbg[:400]}\n[debug] last 150:\n{dbg[-150:]}\n[debug]---")
         rewards = []
