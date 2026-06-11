@@ -152,6 +152,12 @@ def build_dynamic_feedback(solution_code: str, row: dict, max_len: int = 1500) -
     except Exception as exc:
         print(f"[dyn-feedback] evaluation failed: {exc}")
         return ""
+    # If the attempt already passes everything, there is NOTHING to correct.
+    # (A misleading "not fully correct" message here actively damaged the policy:
+    # idx 38 greedy collapsed 1.0 -> 0.15 after one step of distilling toward a
+    # teacher that was told a perfect solution was wrong.)
+    if float(out.get("score", 0.0)) >= 1.0:
+        return ""
     fb = ""
     det = out.get("details")
     if isinstance(det, dict):
