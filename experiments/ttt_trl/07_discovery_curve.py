@@ -289,6 +289,7 @@ def _build_sdpo_config(
     seed: int,
     temperature: float = 1.0,
     policy_loss_mode: str = "hybrid",
+    thinking: bool = False,
     report_to: str = "none",
 ) -> SDPOConfig:
     requested = {
@@ -305,7 +306,7 @@ def _build_sdpo_config(
         # statements (grid problems!) -> model continues the cut-off text instead
         # of answering -> rambling rollouts, reward 0. Long problems need room.
         "max_prompt_length": 4096,
-        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 300.0},
+        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 600.0},
         # Thinking-off must reach the TRAINER's internal rendering, not just our
         # eval. The monkey-patch on tok.apply_chat_template did NOT propagate to
         # the student-rollout prompt (GRPOTrainer renders via the trl
@@ -314,7 +315,7 @@ def _build_sdpo_config(
         # (grpo_trainer line 1951) AND teacher reprompt tokenization. Without it
         # Qwen3 emits <think> blocks, blows the token budget, never produces a
         # ```python``` block -> every training rollout scores 0 (the artifact).
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": thinking},
         "gradient_checkpointing": True,
         "distillation_topk": 20,
         "full_logit_distillation": True,
@@ -473,6 +474,7 @@ def main() -> None:
         seed=args.seed,
         temperature=args.temperature,
         policy_loss_mode=args.policy_loss_mode,
+        thinking=args.thinking,
         report_to=report_to,
     )
 
