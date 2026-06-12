@@ -306,7 +306,10 @@ def _build_sdpo_config(
         # statements (grid problems!) -> model continues the cut-off text instead
         # of answering -> rambling rollouts, reward 0. Long problems need room.
         "max_prompt_length": 4096,
-        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 600.0},
+        # max_time must comfortably exceed the time to generate max_new_tokens
+        # (8B + thinking 20k tokens needs 15-20 min). 600s silently truncated
+        # mid-think -> all-zero training rewards while eval (no max_time) scored.
+        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 2400.0},
         # Thinking-off must reach the TRAINER's internal rendering, not just our
         # eval. The monkey-patch on tok.apply_chat_template did NOT propagate to
         # the student-rollout prompt (GRPOTrainer renders via the trl
