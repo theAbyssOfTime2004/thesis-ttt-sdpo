@@ -11,7 +11,10 @@
 #   (evaluator.py -> verl.utils.reward_score.feedback.code).
 # - pylatexenc: needed by verl reward/code path.
 
-trl>=0.12
+# Pinned: TRL 1.6.0 renamed SDPO config fields (distillation_mode/distillation_weight
+# replaced full_logit_distillation/sdpo_policy_loss_mode). 07 passes both name sets,
+# but pin anyway so future renames don't silently change experiment semantics.
+trl==1.6.0
 peft
 accelerate
 datasets

@@ -317,12 +317,17 @@ def _build_sdpo_config(
         # ```python``` block -> every training rollout scores 0 (the artifact).
         "chat_template_kwargs": {"enable_thinking": thinking},
         "gradient_checkpointing": True,
+        # Logit-level top-k SDPO (paper: logit > token > sequence), reverse KL.
+        # Old TRL (<=1.5) names AND new TRL 1.6 names both included; the
+        # _filter_supported_kwargs call keeps whichever the installed trl has.
         "distillation_topk": 20,
-        "full_logit_distillation": True,
         "distillation_alpha": 1.0,
-        # hybrid = GRPO policy term (reinforces high-reward rollouts directly)
-        # + distillation. distillation_only had no direct success reinforcement.
-        "sdpo_policy_loss_mode": policy_loss_mode,
+        "full_logit_distillation": True,            # trl <=1.5
+        "distillation_mode": "topk_logits",          # trl 1.6
+        # hybrid = GRPO policy term (reinforces high-reward rollouts) + distill.
+        "sdpo_policy_loss_mode": policy_loss_mode,   # trl <=1.5
+        # trl 1.6: blend via weight: (1-w)*policy + w*distillation.
+        "distillation_weight": 0.5 if policy_loss_mode == "hybrid" else 1.0,
         # Feedback path (Path B): teacher gets the public-test hint.
         "include_environment_feedback": True,
         "environment_feedback_only_without_solution": True,
