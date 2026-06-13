@@ -281,6 +281,42 @@ def _build_lora_config(lora_r: int) -> LoraConfig:
     )
 
 
+# --- RQ1: reprompt-template taxonomy (syn_template_taxonomy_rationale) ---------
+# Each preset overrides the SDPO template SLOTS only; everything else (model,
+# feedback content via privileged_context, hyperparams) is held fixed -> clean
+# ablation. Placeholders are fixed by TRL 1.6.0:
+#   reprompt_template -> {prompt}{solution}{feedback}
+#   feedback_template -> {feedback_raw}   (this is our privileged_context)
+#   solution_template -> {successful_previous_attempt}
+# T2_standard == TRL/paper default verbatim, so selecting it is a no-op vs. the
+# previous behaviour (no regression for existing runs / idx 19 / idx 23).
+REPROMPT_TEMPLATES: dict[str, dict[str, str]] = {
+    # T1 - Minimal (Dimension 1, LOW information): teacher is told the attempt was
+    # wrong but NOT why -> feedback_template drops {feedback_raw} test/error detail.
+    "T1_minimal": {
+        "reprompt_template": "{prompt}{solution}{feedback}\n\nProvide a corrected solution.\n",
+        "feedback_template": "\nYour previous attempt was incorrect.\n\n",
+    },
+    # T2 - Standard / anchor: exact TRL+paper defaults (rich feedback included).
+    "T2_standard": {
+        "reprompt_template": "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n",
+        "feedback_template": "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n",
+    },
+    # T5 - Reasoning-inducing (Dimension 2, instruction framing): SAME rich feedback
+    # as T2, but the trailing instruction asks for root-cause analysis first.
+    "T5_reasoning": {
+        "reprompt_template": "{prompt}{solution}{feedback}\n\nFirst, identify the root cause of the failure, then provide a corrected solution.\n",
+        "feedback_template": "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n",
+    },
+    # T6 - First-person (Dimension 2, reframe): SAME rich feedback, reframed as the
+    # model's own self-reflection rather than an external instruction.
+    "T6_first_person": {
+        "reprompt_template": "{prompt}{solution}{feedback}\n\nI attempted this problem and my solution was incorrect. Let me reconsider and write a correct solution.\n",
+        "feedback_template": "\nHere is the feedback from my unsuccessful earlier attempt:\n\n{feedback_raw}\n\n",
+    },
+}
+
+
 def _build_sdpo_config(
     problem_output_dir: pathlib.Path,
     num_generations: int,
@@ -290,6 +326,7 @@ def _build_sdpo_config(
     temperature: float = 1.0,
     policy_loss_mode: str = "hybrid",
     thinking: bool = False,
+    reprompt_template: str = "T2_standard",
     report_to: str = "none",
 ) -> SDPOConfig:
     requested = {
@@ -340,6 +377,15 @@ def _build_sdpo_config(
         "seed": seed,
         "report_to": report_to,
     }
+    # RQ1 variable: overlay the chosen reprompt-template preset (slots only).
+    if reprompt_template not in REPROMPT_TEMPLATES:
+        raise SystemExit(
+            f"Unknown --reprompt_template {reprompt_template!r}; "
+            f"choices: {sorted(REPROMPT_TEMPLATES)}"
+        )
+    requested.update(REPROMPT_TEMPLATES[reprompt_template])
+    print(f"[template] preset={reprompt_template} -> "
+          f"reprompt={REPROMPT_TEMPLATES[reprompt_template]['reprompt_template']!r}")
     filtered = _filter_supported_kwargs(SDPOConfig, requested)
     dropped = set(requested) - set(filtered)
     if dropped:
@@ -382,6 +428,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy_loss_mode", type=str, default="hybrid",
                         choices=["hybrid", "distillation_only"],
                         help="hybrid adds GRPO policy term that reinforces successes.")
+    parser.add_argument("--reprompt_template", type=str, default="T2_standard",
+                        choices=sorted(REPROMPT_TEMPLATES),
+                        help="RQ1 variable: which reprompt-template preset the SDPO "
+                             "teacher uses. T2_standard = paper/TRL default (anchor).")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Training sampling temp. Lower (0.7) curbs rambling -> more code.")
     parser.add_argument("--dynamic_feedback", action="store_true",
@@ -415,7 +465,7 @@ def main() -> None:
 
         wandb.init(
             project=args.wandb_project,
-            name=f"discovery-{args.model_name.split('/')[-1]}-idx{args.problem_index}-{args.max_steps}step-{args.policy_loss_mode}",
+            name=f"discovery-{args.model_name.split('/')[-1]}-idx{args.problem_index}-{args.max_steps}step-{args.policy_loss_mode}-{args.reprompt_template}",
             config=vars(args),
         )
 
@@ -483,6 +533,7 @@ def main() -> None:
         temperature=args.temperature,
         policy_loss_mode=args.policy_loss_mode,
         thinking=args.thinking,
+        reprompt_template=args.reprompt_template,
         report_to=report_to,
     )
 
