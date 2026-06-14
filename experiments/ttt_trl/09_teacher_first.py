@@ -13,8 +13,15 @@ Differs from 07 (student-first SDPOTrainer baseline):
   Only the student forward carries gradient; teacher forward is stopgrad.
 
 Spec: syn_teacher_first_impl_spec.md  (decisions in section 4 resolved:
-  * reference_mode flag {best_in_batch,none}, default best_in_batch
-  * KL reuse: trl SelfDistillationMixin._compute_divergence (reverse KL, top-k))
+  * reference_mode flag {best_in_batch,ground_truth,none}, default best_in_batch
+  * KL reuse: trl==1.6.0 trl.experimental.sdpo.loss_utils
+    .compute_topk_self_distillation_loss (reverse KL alpha=1.0, top-k, add_tail)
+    -- the SAME function SDPOTrainer uses, so the two arms stay comparable.)
+
+TRL PIN: trl==1.6.0 (colab/requirements_colab.txt). In 1.6.0 the divergence
+helpers are module-level functions in trl.experimental.sdpo.loss_utils. There is
+NO trl.experimental.self_distillation / SelfDistillationMixin in 1.6.0 -- do not
+import from that path (it crashes on Colab).
 """
 
 from __future__ import annotations
@@ -398,7 +405,7 @@ def teacher_first_step(
         if verbose and contributing == 0:
             kl_val = item_loss.item()
             print(f"[kl-sanity] L={length} s_slice={tuple(s_slice.shape)} "
-                  f"t_slice={tuple(t_slice.shape)} topk={k} KL(token-mean)={kl_val:.6f}")
+                  f"t_slice={tuple(t_slice.shape)} topk={kl_topk} KL(token-mean)={kl_val:.6f}")
             assert kl_val > 0, f"KL should be > 0 on step 1 (got {kl_val}); check alignment/sign"
 
         (item_loss / n).backward()
