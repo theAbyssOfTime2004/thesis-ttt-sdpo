@@ -346,12 +346,18 @@ def teacher_first_step(
     """
     device = next(model.parameters()).device
 
-    student_prefix_ids = tokenizer.apply_chat_template(
-        student_messages, add_generation_prompt=True, return_tensors="pt"
-    ).to(device)
-    teacher_prefix_ids = tokenizer.apply_chat_template(
-        teacher_messages, add_generation_prompt=True, return_tensors="pt"
-    ).to(device)
+    # NOTE: apply_chat_template(return_tensors="pt") returns a BatchEncoding (dict)
+    # in this transformers version, not a bare tensor -> .shape fails. Render to
+    # text then tokenize, SAME pattern as teacher_generate so prefix tokenization
+    # stays consistent between generation and the KL step.
+    student_prefix_text = tokenizer.apply_chat_template(
+        student_messages, add_generation_prompt=True, tokenize=False
+    )
+    teacher_prefix_text = tokenizer.apply_chat_template(
+        teacher_messages, add_generation_prompt=True, tokenize=False
+    )
+    student_prefix_ids = tokenizer(student_prefix_text, return_tensors="pt").input_ids.to(device)
+    teacher_prefix_ids = tokenizer(teacher_prefix_text, return_tensors="pt").input_ids.to(device)
     s_prefix = student_prefix_ids.shape[1]
     t_prefix = teacher_prefix_ids.shape[1]
     if verbose:
