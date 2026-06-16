@@ -26,8 +26,12 @@ omegaconf
 hydra-core
 pylatexenc
 torchao>=0.16.0
-# Optional LLM judge (09_teacher_first.py --judge llm): current Google GenAI SDK
-# is `google-genai` (import: `from google import genai`); free-tier flash model
-# default is gemini-2.5-flash. Needs env GEMINI_API_KEY (or GOOGLE_API_KEY).
-# NOTE: the deprecated `google-generativeai` package is NOT this one -- do not use it.
+# Optional LLM judge (09_teacher_first.py --judge llm). Provider chain:
+#   gemini (primary) -> groq -> openrouter -> difflib.
+# - gemini: needs the `google-genai` SDK below (`from google import genai`);
+#   default model gemini-2.5-flash. Key: env GEMINI_API_KEY (or GOOGLE_API_KEY).
+#   NOTE: the deprecated `google-generativeai` package is NOT this one.
+# - groq / openrouter: OpenAI-compatible REST called via stdlib urllib -> NO extra
+#   dependency. Keys: env GROQ_API_KEY / OPENROUTER_API_KEY. Select with
+#   --judge_provider {gemini,groq,openrouter}; fallbacks via --judge_fallback.
 google-genai

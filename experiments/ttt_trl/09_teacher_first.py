@@ -221,19 +221,65 @@ def teacher_generate(
 
 
 # --------------------------------------------------------------------------- #
-# Optional LLM judge (Gemini free tier). Alternative to the difflib similarity
-# step ONLY -- the verifier (evaluate_solution) still decides correctness. The
-# judge runs exclusively on verifier-correct trajectories and decides, among
-# them, good (independent + clear reasoning) vs bad (copy of reference / poor).
+# Optional LLM judge. Alternative to the difflib similarity step ONLY -- the
+# verifier (evaluate_solution) still decides correctness. The judge runs only on
+# verifier-correct trajectories and decides, among them, good (independent +
+# clear reasoning) vs bad (copy of reference / poor).
 #
-# SDK: google-genai (`from google import genai`); model default gemini-2.5-flash.
-# API key: read from env GEMINI_API_KEY (or GOOGLE_API_KEY) by genai.Client().
+# Providers are tried as a CHAIN so a quota-exhausted primary falls through to a
+# free backup, and finally to difflib -- the run never crashes:
+#   - gemini     : google-genai SDK. key GEMINI_API_KEY / GOOGLE_API_KEY.
+#   - groq       : OpenAI-compatible REST (raw HTTP). key GROQ_API_KEY.
+#   - openrouter : OpenAI-compatible REST (raw HTTP). key OPENROUTER_API_KEY.
+# groq/openrouter use only stdlib urllib -> no extra pip dependency.
 # --------------------------------------------------------------------------- #
 class JudgeUnavailable(Exception):
     """Raised when the LLM judge cannot return a verdict -> caller falls back to difflib."""
 
 
-_GENAI_CLIENT = None  # lazily created, reused across calls (one client per run)
+class _ProviderError(Exception):
+    """Normalized provider error carrying an HTTP-ish status code (or None)."""
+
+    def __init__(self, code: int | None, message: str):
+        self.code = code
+        super().__init__(message)
+
+
+_GENAI_CLIENT = None  # lazily created, reused across calls (one gemini client per run)
+
+# Default model per provider (used for fallback providers, and for the primary
+# provider when its model is left empty).
+_PROVIDER_DEFAULT_MODEL = {
+    "gemini": "gemini-2.5-flash",
+    "groq": "llama-3.3-70b-versatile",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
+}
+
+# Env var(s) holding each provider's API key (first non-empty wins).
+_PROVIDER_ENV = {
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "groq": ("GROQ_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+}
+
+# OpenAI-compatible chat-completions endpoints (gemini uses its own SDK).
+_OPENAI_COMPAT_URL = {
+    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+}
+
+
+def _provider_key(provider: str) -> str | None:
+    for env in _PROVIDER_ENV.get(provider, ()):
+        val = os.environ.get(env)
+        if val:
+            return val
+    return None
+
+
+def _provider_has_key(provider: str) -> bool:
+    return _provider_key(provider) is not None
+
 
 _JUDGE_SCHEMA = {
     "type": "OBJECT",
@@ -283,67 +329,181 @@ def _get_genai_client():
     return _GENAI_CLIENT
 
 
-def llm_judge(
-    problem_text: str,
-    reference_code: str,
-    candidate_code: str,
-    model: str,
-    max_retries: int = 4,
-    base_delay: float = 2.0,
-) -> dict:
-    """
-    Ask Gemini whether `candidate_code` is a copy of `reference_code` and how clear
-    its reasoning is. temperature=0, structured JSON output.
+def _parse_judge_json(raw: str) -> dict:
+    """Parse the judge's JSON, tolerating code fences / surrounding prose."""
+    raw = (raw or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)  # first {...} block
+        if match:
+            return json.loads(match.group(0))
+        raise
 
-    Returns {"is_copy": bool, "reasoning_quality": int(1-5), "verdict": "good"|"bad",
-             "raw": <raw json str>}.  verdict good := (not is_copy) and reasoning_quality >= 3.
 
-    Retries on 429/503 with exponential backoff; raises JudgeUnavailable if it
-    still cannot produce a verdict (caller falls back to difflib -- never crashes).
-    """
+def _call_gemini(model: str, prompt: str) -> str:
+    """Gemini via google-genai. Returns raw JSON text. Raises _ProviderError."""
     from google.genai import errors as genai_errors
     from google.genai import types as genai_types
 
     try:
-        client = _get_genai_client()  # missing key / bad SDK -> fall back, don't crash
-    except Exception as exc:  # noqa: BLE001
-        raise JudgeUnavailable(f"genai client unavailable ({type(exc).__name__}: {exc})") from exc
+        client = _get_genai_client()
+    except Exception as exc:  # noqa: BLE001  (missing key / bad SDK)
+        raise _ProviderError(None, f"gemini client unavailable: {exc}") from exc
 
-    prompt = _JUDGE_PROMPT.format(
-        problem=problem_text[:8000],  # cap problem text to keep tokens bounded
-        reference=reference_code,
-        candidate=candidate_code,
-    )
     config = genai_types.GenerateContentConfig(
         temperature=0,
         response_mime_type="application/json",
         response_schema=_JUDGE_SCHEMA,
     )
+    try:
+        resp = client.models.generate_content(model=model, contents=prompt, config=config)
+    except genai_errors.APIError as exc:
+        raise _ProviderError(getattr(exc, "code", None), str(exc)) from exc
+    return resp.text or ""
+
+
+def _call_openai_compat(provider: str, model: str, prompt: str) -> str:
+    """Groq/OpenRouter via OpenAI-compatible REST (stdlib urllib). Raises _ProviderError."""
+    import urllib.error
+    import urllib.request
+
+    key = _provider_key(provider)
+    if not key:
+        raise _ProviderError(None, f"{provider}: no API key in env")
+    url = _OPENAI_COMPAT_URL[provider]
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+    ).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        # urllib's default UA ("Python-urllib/..") is Cloudflare-blocked by Groq (403/1010).
+        "User-Agent": "ttt-sdpo-judge/1.0",
+    }
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://github.com/sdpo/ttt"  # OpenRouter attribution (optional)
+        headers["X-Title"] = "ttt-sdpo-judge"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore")[:200] if hasattr(exc, "read") else ""
+        raise _ProviderError(exc.code, f"{provider} HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise _ProviderError(None, f"{provider} network error: {exc}") from exc
+    try:
+        return payload["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError) as exc:
+        raise _ProviderError(None, f"{provider} unexpected response shape: {exc}") from exc
+
+
+def _call_provider(provider: str, model: str, prompt: str) -> str:
+    if provider == "gemini":
+        return _call_gemini(model, prompt)
+    if provider in _OPENAI_COMPAT_URL:
+        return _call_openai_compat(provider, model, prompt)
+    raise _ProviderError(None, f"unknown provider {provider!r}")
+
+
+def _build_provider_chain(
+    provider: str,
+    model: str,
+    fallback_providers: list[str] | None,
+    provider_models: dict[str, str] | None,
+) -> list[tuple[str, str]]:
+    """Primary first, then each fallback provider that actually has an API key."""
+    primary_model = model or _PROVIDER_DEFAULT_MODEL.get(provider, model)
+    chain: list[tuple[str, str]] = [(provider, primary_model)]
+    seen = {provider}
+    for prov in fallback_providers or []:
+        if prov in seen or not _provider_has_key(prov):
+            continue
+        seen.add(prov)
+        mdl = (provider_models or {}).get(prov) or _PROVIDER_DEFAULT_MODEL.get(prov, primary_model)
+        chain.append((prov, mdl))
+    return chain
+
+
+def llm_judge(
+    problem_text: str,
+    reference_code: str,
+    candidate_code: str,
+    model: str,
+    provider: str = "gemini",
+    fallback_providers: list[str] | None = None,
+    provider_models: dict[str, str] | None = None,
+    max_retries: int = 4,
+    base_delay: float = 2.0,
+) -> dict:
+    """
+    Ask an LLM whether `candidate_code` is a copy of `reference_code` and how clear
+    its reasoning is. temperature=0, structured JSON output.
+
+    Tries providers as a chain: `provider` (primary) first, then any of
+    `fallback_providers` that have an API key set. Within a provider, retries on
+    429/503 with exponential backoff only when it's the LAST provider in the chain
+    (otherwise a 429 immediately switches to the next provider, so a quota-exhausted
+    primary doesn't waste time waiting). Raises JudgeUnavailable if the whole chain
+    fails -> caller falls back to difflib (the run never crashes).
+
+    Returns {"is_copy": bool, "reasoning_quality": int(1-5), "verdict": "good"|"bad",
+             "raw": <raw json str>, "provider": str, "model": str}.
+    verdict good := (not is_copy) and reasoning_quality >= 3.
+    """
+    prompt = _JUDGE_PROMPT.format(
+        problem=problem_text[:8000],  # cap problem text to keep tokens bounded
+        reference=reference_code,
+        candidate=candidate_code,
+    )
+    chain = _build_provider_chain(provider, model, fallback_providers, provider_models)
 
     last_exc: Exception | None = None
-    for attempt in range(max_retries):
-        try:
-            resp = client.models.generate_content(model=model, contents=prompt, config=config)
-            raw = resp.text or ""
-            data = json.loads(raw)
-            is_copy = bool(data["is_copy"])
-            rq = int(data["reasoning_quality"])
-            verdict = "good" if (not is_copy and rq >= 3) else "bad"
-            return {"is_copy": is_copy, "reasoning_quality": rq, "verdict": verdict, "raw": raw}
-        except genai_errors.APIError as exc:  # 4xx/5xx from the API
-            last_exc = exc
-            code = getattr(exc, "code", None)
-            if code in (429, 503) and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                print(f"[llm-judge] API {code}; retry {attempt + 1}/{max_retries} in {delay:.1f}s")
-                time.sleep(delay)
-                continue
-            break
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
-            last_exc = exc  # malformed/empty JSON -> no point retrying
-            break
+    for ci, (prov, mdl) in enumerate(chain):
+        is_last = ci == len(chain) - 1
+        for attempt in range(max_retries):
+            try:
+                raw = _call_provider(prov, mdl, prompt)
+                data = _parse_judge_json(raw)
+                is_copy = bool(data["is_copy"])
+                rq = int(data["reasoning_quality"])
+                verdict = "good" if (not is_copy and rq >= 3) else "bad"
+                return {
+                    "is_copy": is_copy,
+                    "reasoning_quality": rq,
+                    "verdict": verdict,
+                    "raw": raw,
+                    "provider": prov,
+                    "model": mdl,
+                }
+            except _ProviderError as exc:
+                last_exc = exc
+                # Wait-and-retry only if it's worth it: last provider in the chain
+                # (no alternative), or a transient 503. A 429 on a non-last provider
+                # switches immediately to the next provider.
+                retryable = exc.code in (429, 503)
+                if retryable and (is_last or exc.code == 503) and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"[llm-judge] {prov} {exc.code}; retry {attempt + 1}/{max_retries} "
+                          f"in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+                print(f"[llm-judge] {prov} failed ({exc}); "
+                      f"{'switching provider' if not is_last else 'chain exhausted'}")
+                break
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+                last_exc = exc  # malformed/empty JSON -> try next provider
+                print(f"[llm-judge] {prov} bad JSON ({type(exc).__name__}); "
+                      f"{'switching provider' if not is_last else 'chain exhausted'}")
+                break
 
-    raise JudgeUnavailable(f"llm_judge failed ({type(last_exc).__name__}: {last_exc})")
+    raise JudgeUnavailable(f"all judge providers failed (last: {type(last_exc).__name__}: {last_exc})")
 
 
 def _cached_llm_judge(
@@ -353,6 +513,9 @@ def _cached_llm_judge(
     reference_code: str,
     candidate_code: str,
     model: str,
+    provider: str = "gemini",
+    fallback_providers: list[str] | None = None,
+    provider_models: dict[str, str] | None = None,
 ) -> dict:
     """
     Judge once per (problem_id, candidate_code). The TTT loop collapses to near-
@@ -362,9 +525,14 @@ def _cached_llm_judge(
     key = hashlib.sha256(f"{problem_id}\x00{candidate_code}".encode("utf-8")).hexdigest()
     if key in cache:
         return cache[key]
-    result = llm_judge(problem_text, reference_code, candidate_code, model)
+    result = llm_judge(
+        problem_text, reference_code, candidate_code, model,
+        provider=provider, fallback_providers=fallback_providers,
+        provider_models=provider_models,
+    )
     cache[key] = result
-    print(f"[llm-judge] problem_id={problem_id} verdict={result['verdict']} raw={result['raw']}")
+    print(f"[llm-judge] problem_id={problem_id} provider={result['provider']} "
+          f"verdict={result['verdict']} raw={result['raw']}")
     return result
 
 
@@ -411,6 +579,9 @@ def filter_trajectories(
     judge_cache: dict | None = None,
     problem_id: str = "",
     problem_text: str = "",
+    judge_provider: str = "gemini",
+    judge_fallback_providers: list[str] | None = None,
+    judge_provider_models: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """
     good := correct AND independent ; bad := copy of reference (or wrong in 'none' mode).
@@ -470,7 +641,10 @@ def filter_trajectories(
                 else:
                     try:
                         verdict = _cached_llm_judge(
-                            judge_cache, problem_id, problem_text, ref, code, judge_model
+                            judge_cache, problem_id, problem_text, ref, code, judge_model,
+                            provider=judge_provider,
+                            fallback_providers=judge_fallback_providers,
+                            provider_models=judge_provider_models,
                         )["verdict"]
                         judge_calls += 1
                         (good if verdict == "good" else bad).append({"code": code, "score": s})
@@ -655,9 +829,23 @@ def parse_args() -> argparse.Namespace:
                              "best_in_batch=code P0, ground_truth=math P2, none=ablation.")
     parser.add_argument("--judge", type=str, default="difflib", choices=["difflib", "llm"],
                         help="Independence judge among verifier-correct trajectories: "
-                             "difflib (default, current behavior) or llm (Gemini).")
+                             "difflib (default, current behavior) or llm.")
+    parser.add_argument("--judge_provider", type=str, default="gemini",
+                        choices=["gemini", "groq", "openrouter"],
+                        help="Primary LLM-judge provider for --judge llm.")
+    parser.add_argument("--judge_fallback", type=str, nargs="*",
+                        default=["gemini", "groq", "openrouter"],
+                        choices=["gemini", "groq", "openrouter"],
+                        help="Fallback providers tried (in order) if the primary is "
+                             "quota-exhausted/unavailable; only those with an API key are used. "
+                             "Final fallback is always difflib.")
     parser.add_argument("--judge_model", type=str, default="gemini-2.5-flash",
                         help="Gemini model for --judge llm (free-tier flash default).")
+    parser.add_argument("--judge_groq_model", type=str, default="llama-3.3-70b-versatile",
+                        help="Groq model (when groq is used as primary or fallback).")
+    parser.add_argument("--judge_openrouter_model", type=str,
+                        default="meta-llama/llama-3.3-70b-instruct:free",
+                        help="OpenRouter model (when openrouter is used as primary or fallback).")
     parser.add_argument("--kl_topk", type=int, default=20)
     parser.add_argument("--kl_alpha", type=float, default=1.0, help="1.0 = reverse KL (lasgroup LCBv6).")
     parser.add_argument("--reprompt_template", type=str, default="T2_standard",
@@ -690,10 +878,28 @@ def main() -> None:
     print(f"GPU: {device_name}")
     print(f"Total VRAM: {total_vram_gb:.2f} GB")
     print(f"Seed: {args.seed} | reference_mode={args.reference_mode} | fewshot={args.fewshot_option}")
-    print(f"Judge: {args.judge}" + (f" (model={args.judge_model})" if args.judge == "llm" else ""))
-    if args.judge == "llm" and not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        print("[llm-judge][WARN] GEMINI_API_KEY/GOOGLE_API_KEY not set -- judge calls "
-              "will fail and fall back to difflib. Set: export GEMINI_API_KEY=<your key>")
+
+    # Resolve the LLM-judge provider chain once (primary + fallbacks that have keys).
+    judge_provider_models = {
+        "gemini": args.judge_model,
+        "groq": args.judge_groq_model,
+        "openrouter": args.judge_openrouter_model,
+    }
+    judge_primary_model = judge_provider_models[args.judge_provider]
+    if args.judge == "llm":
+        chain = _build_provider_chain(
+            args.judge_provider, judge_primary_model, args.judge_fallback, judge_provider_models
+        )
+        usable = [f"{p}:{m}" for p, m in chain if _provider_has_key(p)]
+        print(f"Judge: llm | provider chain: {[f'{p}:{m}' for p, m in chain]}")
+        if usable:
+            print(f"[llm-judge] usable providers (key present): {usable}")
+        else:
+            print("[llm-judge][WARN] no provider has an API key set -- judge calls will "
+                  "fall back to difflib. Set one of: GEMINI_API_KEY / GROQ_API_KEY / "
+                  "OPENROUTER_API_KEY.")
+    else:
+        print(f"Judge: {args.judge}")
 
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -774,8 +980,11 @@ def main() -> None:
 
         good, bad, stats = filter_trajectories(
             trajectories, row, args.sim_threshold, args.reference_mode,
-            judge=args.judge, judge_model=args.judge_model, judge_cache=judge_cache,
+            judge=args.judge, judge_model=judge_primary_model, judge_cache=judge_cache,
             problem_id=str(problem_id), problem_text=question_content,
+            judge_provider=args.judge_provider,
+            judge_fallback_providers=args.judge_fallback,
+            judge_provider_models=judge_provider_models,
         )
         good_pool = _update_pool(good_pool, good, args.pool_cap)
         bad_pool = _update_pool(bad_pool, bad, args.pool_cap)
