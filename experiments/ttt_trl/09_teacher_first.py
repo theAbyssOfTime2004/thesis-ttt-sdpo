@@ -29,11 +29,13 @@ from __future__ import annotations
 import argparse
 import difflib
 import gc
+import hashlib
 import importlib
 import json
 import math
 import os
 import pathlib
+import random
 import re
 import statistics
 import sys
@@ -219,6 +221,154 @@ def teacher_generate(
 
 
 # --------------------------------------------------------------------------- #
+# Optional LLM judge (Gemini free tier). Alternative to the difflib similarity
+# step ONLY -- the verifier (evaluate_solution) still decides correctness. The
+# judge runs exclusively on verifier-correct trajectories and decides, among
+# them, good (independent + clear reasoning) vs bad (copy of reference / poor).
+#
+# SDK: google-genai (`from google import genai`); model default gemini-2.5-flash.
+# API key: read from env GEMINI_API_KEY (or GOOGLE_API_KEY) by genai.Client().
+# --------------------------------------------------------------------------- #
+class JudgeUnavailable(Exception):
+    """Raised when the LLM judge cannot return a verdict -> caller falls back to difflib."""
+
+
+_GENAI_CLIENT = None  # lazily created, reused across calls (one client per run)
+
+_JUDGE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "is_copy": {"type": "BOOLEAN"},
+        "reasoning_quality": {"type": "INTEGER"},
+    },
+    "required": ["is_copy", "reasoning_quality"],
+}
+
+_JUDGE_PROMPT = """You are judging a CANDIDATE solution to a competitive-programming problem.
+
+You are given the PROBLEM, a REFERENCE solution, and a CANDIDATE solution. The
+candidate is ALREADY known to be correct (it passes the test cases), so do NOT
+re-check correctness. Decide only two things:
+
+  1. is_copy: Is the candidate essentially a copy of the reference solution --
+     i.e. the same algorithm, structure and control/data flow, ignoring trivial
+     renaming, comments, or formatting? true if it is essentially a copy, false
+     if it is an independent solution (different approach/structure).
+  2. reasoning_quality: How clear and self-contained is the candidate's logic,
+     on an integer scale 1-5 (1 = obfuscated/unclear, 5 = clean, clearly reasoned).
+
+PROBLEM:
+{problem}
+
+REFERENCE SOLUTION:
+```python
+{reference}
+```
+
+CANDIDATE SOLUTION:
+```python
+{candidate}
+```
+
+Return ONLY JSON with keys: is_copy (boolean) and reasoning_quality (integer 1-5)."""
+
+
+def _get_genai_client():
+    """Create (once) and return a google-genai client. Reads the API key from env."""
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is None:
+        from google import genai  # imported lazily so --judge difflib needs no SDK
+
+        _GENAI_CLIENT = genai.Client()  # picks up GEMINI_API_KEY / GOOGLE_API_KEY
+    return _GENAI_CLIENT
+
+
+def llm_judge(
+    problem_text: str,
+    reference_code: str,
+    candidate_code: str,
+    model: str,
+    max_retries: int = 4,
+    base_delay: float = 2.0,
+) -> dict:
+    """
+    Ask Gemini whether `candidate_code` is a copy of `reference_code` and how clear
+    its reasoning is. temperature=0, structured JSON output.
+
+    Returns {"is_copy": bool, "reasoning_quality": int(1-5), "verdict": "good"|"bad",
+             "raw": <raw json str>}.  verdict good := (not is_copy) and reasoning_quality >= 3.
+
+    Retries on 429/503 with exponential backoff; raises JudgeUnavailable if it
+    still cannot produce a verdict (caller falls back to difflib -- never crashes).
+    """
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
+
+    try:
+        client = _get_genai_client()  # missing key / bad SDK -> fall back, don't crash
+    except Exception as exc:  # noqa: BLE001
+        raise JudgeUnavailable(f"genai client unavailable ({type(exc).__name__}: {exc})") from exc
+
+    prompt = _JUDGE_PROMPT.format(
+        problem=problem_text[:8000],  # cap problem text to keep tokens bounded
+        reference=reference_code,
+        candidate=candidate_code,
+    )
+    config = genai_types.GenerateContentConfig(
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=_JUDGE_SCHEMA,
+    )
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt, config=config)
+            raw = resp.text or ""
+            data = json.loads(raw)
+            is_copy = bool(data["is_copy"])
+            rq = int(data["reasoning_quality"])
+            verdict = "good" if (not is_copy and rq >= 3) else "bad"
+            return {"is_copy": is_copy, "reasoning_quality": rq, "verdict": verdict, "raw": raw}
+        except genai_errors.APIError as exc:  # 4xx/5xx from the API
+            last_exc = exc
+            code = getattr(exc, "code", None)
+            if code in (429, 503) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                print(f"[llm-judge] API {code}; retry {attempt + 1}/{max_retries} in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            break
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            last_exc = exc  # malformed/empty JSON -> no point retrying
+            break
+
+    raise JudgeUnavailable(f"llm_judge failed ({type(last_exc).__name__}: {last_exc})")
+
+
+def _cached_llm_judge(
+    cache: dict,
+    problem_id: str,
+    problem_text: str,
+    reference_code: str,
+    candidate_code: str,
+    model: str,
+) -> dict:
+    """
+    Judge once per (problem_id, candidate_code). The TTT loop collapses to near-
+    identical trajectories, so caching keeps real API calls to ~10-20 per run.
+    Only successful judgments are cached. Logs every fresh judgment for repro.
+    """
+    key = hashlib.sha256(f"{problem_id}\x00{candidate_code}".encode("utf-8")).hexdigest()
+    if key in cache:
+        return cache[key]
+    result = llm_judge(problem_text, reference_code, candidate_code, model)
+    cache[key] = result
+    print(f"[llm-judge] problem_id={problem_id} verdict={result['verdict']} raw={result['raw']}")
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Judge / filter.
 # --------------------------------------------------------------------------- #
 def get_reference_text(
@@ -256,14 +406,28 @@ def filter_trajectories(
     row: dict,
     sim_threshold: float,
     reference_mode: str,
+    judge: str = "difflib",
+    judge_model: str | None = None,
+    judge_cache: dict | None = None,
+    problem_id: str = "",
+    problem_text: str = "",
 ) -> tuple[list[dict], list[dict], dict]:
     """
     good := correct AND independent ; bad := copy of reference (or wrong in 'none' mode).
 
-    Fallback (spec): if similarity removes every good trajectory but at least one
-    correct (score>=1.0) trajectory exists, keep the best-scoring correct one so the
-    good pool never collapses to empty purely due to the copy filter.
+    Independence test (the good/bad decision among verifier-correct trajectories):
+      - judge="difflib" (default): normalized-code similarity vs the reference.
+      - judge="llm": Gemini decides copy/independence + reasoning quality, run ONLY
+        on verifier-correct trajectories; incorrect trajectories are ignored. The
+        difflib similarity is still computed (for logging + per-trajectory fallback
+        if the API fails). Either way the verifier alone decides correctness.
+
+    Fallback (spec): if the independence filter removes every good trajectory but at
+    least one correct (score>=1.0) trajectory exists, keep the best-scoring correct
+    one so the good pool never collapses to empty purely due to the copy filter.
     """
+    if judge_cache is None:
+        judge_cache = {}
     scored: list[tuple[str, float]] = []
     for t in trajectories:
         code = _extract_text(t)
@@ -279,6 +443,9 @@ def filter_trajectories(
     good: list[dict] = []
     bad: list[dict] = []
     sims: list[float] = []
+    judge_calls = 0
+    judge_fallbacks = 0
+    use_llm = judge == "llm" and reference_mode != "none" and bool(ref)
     for i, (code, s) in enumerate(scored):
         if reference_mode == "none" or not ref:
             sim = 0.0
@@ -293,6 +460,27 @@ def filter_trajectories(
                 good.append({"code": code, "score": s})
             elif s <= 0.0:
                 bad.append({"code": code, "score": s})
+        elif use_llm:
+            # Verifier decides correctness; LLM judge decides good/bad ONLY among
+            # the correct ones. Incorrect trajectories are ignored (neither). The
+            # reference trajectory itself is independent by construction.
+            if s >= 1.0:
+                if i == best_idx:
+                    good.append({"code": code, "score": s})
+                else:
+                    try:
+                        verdict = _cached_llm_judge(
+                            judge_cache, problem_id, problem_text, ref, code, judge_model
+                        )["verdict"]
+                        judge_calls += 1
+                        (good if verdict == "good" else bad).append({"code": code, "score": s})
+                    except JudgeUnavailable as exc:
+                        judge_fallbacks += 1
+                        print(f"[llm-judge] fallback to difflib for one trajectory: {exc}")
+                        if sim < sim_threshold:
+                            good.append({"code": code, "score": s})
+                        else:
+                            bad.append({"code": code, "score": s})
         else:
             if s >= 1.0 and sim < sim_threshold:
                 good.append({"code": code, "score": s})
@@ -316,6 +504,9 @@ def filter_trajectories(
         "mean_sim": statistics.mean(sims) if sims else 0.0,
         "scores": [s for _, s in scored],
         "fallback_used": fallback_used,
+        "judge": judge,
+        "judge_calls": judge_calls,
+        "judge_fallbacks": judge_fallbacks,
     }
     return good, bad, stats
 
@@ -462,6 +653,11 @@ def parse_args() -> argparse.Namespace:
                         choices=["best_in_batch", "ground_truth", "none"],
                         help="Similarity reference for the copy-filter (spec 4.1): "
                              "best_in_batch=code P0, ground_truth=math P2, none=ablation.")
+    parser.add_argument("--judge", type=str, default="difflib", choices=["difflib", "llm"],
+                        help="Independence judge among verifier-correct trajectories: "
+                             "difflib (default, current behavior) or llm (Gemini).")
+    parser.add_argument("--judge_model", type=str, default="gemini-2.5-flash",
+                        help="Gemini model for --judge llm (free-tier flash default).")
     parser.add_argument("--kl_topk", type=int, default=20)
     parser.add_argument("--kl_alpha", type=float, default=1.0, help="1.0 = reverse KL (lasgroup LCBv6).")
     parser.add_argument("--reprompt_template", type=str, default="T2_standard",
@@ -494,6 +690,10 @@ def main() -> None:
     print(f"GPU: {device_name}")
     print(f"Total VRAM: {total_vram_gb:.2f} GB")
     print(f"Seed: {args.seed} | reference_mode={args.reference_mode} | fewshot={args.fewshot_option}")
+    print(f"Judge: {args.judge}" + (f" (model={args.judge_model})" if args.judge == "llm" else ""))
+    if args.judge == "llm" and not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        print("[llm-judge][WARN] GEMINI_API_KEY/GOOGLE_API_KEY not set -- judge calls "
+              "will fail and fall back to difflib. Set: export GEMINI_API_KEY=<your key>")
 
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -502,7 +702,7 @@ def main() -> None:
         wandb.init(
             project=args.wandb_project,
             name=f"teacherfirst-{args.model_name.split('/')[-1]}-idx{args.problem_index}"
-                 f"-{args.max_steps}step-{args.fewshot_option}-{args.reprompt_template}",
+                 f"-{args.max_steps}step-{args.fewshot_option}-{args.judge}-{args.reprompt_template}",
             config=vars(args),
         )
 
@@ -550,6 +750,7 @@ def main() -> None:
 
     good_pool: list[dict] = []
     bad_pool: list[dict] = []
+    judge_cache: dict[str, dict] = {}  # (problem_id, candidate_code) -> judgment
     step_records: list[dict] = []
     step_mean_rewards: list[float] = []
 
@@ -573,6 +774,8 @@ def main() -> None:
 
         good, bad, stats = filter_trajectories(
             trajectories, row, args.sim_threshold, args.reference_mode,
+            judge=args.judge, judge_model=args.judge_model, judge_cache=judge_cache,
+            problem_id=str(problem_id), problem_text=question_content,
         )
         good_pool = _update_pool(good_pool, good, args.pool_cap)
         bad_pool = _update_pool(bad_pool, bad, args.pool_cap)
@@ -604,6 +807,8 @@ def main() -> None:
             "good_pool_size": len(good_pool),
             "batch_mean_reward": batch_mean_reward,
             "batch_max_reward": max(stats["scores"]) if stats["scores"] else 0.0,
+            "judge_calls": stats.get("judge_calls", 0),
+            "judge_fallbacks": stats.get("judge_fallbacks", 0),
         }
         step_records.append(rec)
         print(f"[step {step + 1}] n_good={rec['n_good']} n_bad={rec['n_bad']} "

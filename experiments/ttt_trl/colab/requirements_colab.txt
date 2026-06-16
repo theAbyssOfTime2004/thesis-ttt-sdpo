@@ -26,3 +26,8 @@ omegaconf
 hydra-core
 pylatexenc
 torchao>=0.16.0
+# Optional LLM judge (09_teacher_first.py --judge llm): current Google GenAI SDK
+# is `google-genai` (import: `from google import genai`); free-tier flash model
+# default is gemini-2.5-flash. Needs env GEMINI_API_KEY (or GOOGLE_API_KEY).
+# NOTE: the deprecated `google-generativeai` package is NOT this one -- do not use it.
+google-genai
