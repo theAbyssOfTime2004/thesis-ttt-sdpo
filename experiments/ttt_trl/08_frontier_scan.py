@@ -58,7 +58,7 @@ def _prepare_tokenizer(model_name: str, thinking: bool = False):
 
 
 @torch.no_grad()
-def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens, domain) -> dict:
+def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens, domain, debug=False) -> dict:
     device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     question_content = domain.problem_text(row)
@@ -82,11 +82,31 @@ def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens, domain) -> d
     )
     scores = []
     for i in range(out.shape[0]):
-        code = tokenizer.decode(out[i, prompt_len:], skip_special_tokens=True)
+        gen_ids = out[i, prompt_len:]
+        completion = tokenizer.decode(gen_ids, skip_special_tokens=True)
         try:
-            scores.append(float(domain.evaluate(code, row, split="train")["score"]))
-        except Exception:
+            result = domain.evaluate(completion, row, split="train")
+            scores.append(float(result["score"]))
+        except Exception as exc:
+            result = {"score": 0.0, "details": {"error": str(exc)}}
             scores.append(0.0)
+        if debug and i == 0:
+            # Did generation hit the token budget (truncation -> no \boxed) ?
+            n_new = int(gen_ids.shape[0])
+            hit_budget = n_new >= max_new_tokens
+            details = result.get("details", {}) if isinstance(result, dict) else {}
+            gt = domain.reference_answer(row)
+            has_boxed = "\\boxed" in completion
+            print("  [debug] -------- sample[0] --------")
+            print(f"  [debug] new_tokens={n_new} (budget={max_new_tokens}"
+                  f"{', HIT BUDGET -> likely truncated' if hit_budget else ''})")
+            print(f"  [debug] ground_truth answer = {gt!r}")
+            print(f"  [debug] extracted pred      = {details.get('pred')!r}")
+            print(f"  [debug] score={result.get('score')} "
+                  f"incorrect_format={details.get('incorrect_format')} "
+                  f"has_boxed={has_boxed}")
+            print(f"  [debug] completion LAST 300 chars:\n{completion[-300:]}")
+            print("  [debug] ---------------------------")
     pass_rate = sum(1 for s in scores if s >= 1.0) / len(scores)
     return {"pass_rate": pass_rate, "mean_score": statistics.mean(scores), "scores": scores}
 
@@ -102,6 +122,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_samples", type=int, default=4)
     p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--thinking", action="store_true")
+    p.add_argument("--debug", action="store_true",
+                   help="Print per-problem sample[0]: ground-truth vs extracted answer, "
+                        "token count / truncation, and last 300 chars of the completion.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output_dir", type=str, default="outputs/08_frontier_scan")
     return p.parse_args()
@@ -137,7 +160,7 @@ def main() -> None:
         pid = domain.problem_id(row) or f"idx_{idx}"
         diff = domain.difficulty(row)
         try:
-            r = pass_rate_for(model, tokenizer, row, args.n_samples, args.max_new_tokens, domain)
+            r = pass_rate_for(model, tokenizer, row, args.n_samples, args.max_new_tokens, domain, debug=args.debug)
         except Exception as exc:
             print(f"{idx} | {pid} | {diff} | ERROR: {exc}")
             results.append({"idx": idx, "problem_id": pid, "difficulty": diff, "error": str(exc)})
