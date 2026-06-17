@@ -26,7 +26,7 @@ from transformers.utils import hub as hub_utils
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from experiments.ttt_trl.evaluator import evaluate_solution, load_lcbv6_split
+from experiments.ttt_trl.domains import get_domain
 
 
 def _prepare_tokenizer(model_name: str, thinking: bool = False):
@@ -58,17 +58,13 @@ def _prepare_tokenizer(model_name: str, thinking: bool = False):
 
 
 @torch.no_grad()
-def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens) -> dict:
+def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens, domain) -> dict:
     device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    question_content = str(row.get("question_content", ""))
+    question_content = domain.problem_text(row)
     # Match 07's directive so scan pass-rates are consistent with the TTT runs.
-    directive = (
-        "\n\nRespond with ONLY the complete Python solution inside a single "
-        "```python ... ``` block. Do not explain. Read input from stdin, print to stdout."
-    )
     prompt_text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": question_content + directive}],
+        [{"role": "user", "content": question_content + domain.directive()}],
         add_generation_prompt=True, tokenize=False,
     )
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
@@ -88,7 +84,7 @@ def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens) -> dict:
     for i in range(out.shape[0]):
         code = tokenizer.decode(out[i, prompt_len:], skip_special_tokens=True)
         try:
-            scores.append(float(evaluate_solution(code, row, split="train")["score"]))
+            scores.append(float(domain.evaluate(code, row, split="train")["score"]))
         except Exception:
             scores.append(0.0)
     pass_rate = sum(1 for s in scores if s >= 1.0) / len(scores)
@@ -97,6 +93,9 @@ def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens) -> dict:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Scan LCBv6 for frontier problems (one-shot pass rate in (0,1)).")
+    p.add_argument("--domain", type=str, default="code", choices=["code", "math"],
+                   help="Task domain: code (LCBv6, default) or math (MATH-500). "
+                        "For math, run WITH --thinking and high --max_new_tokens.")
     p.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
     p.add_argument("--start", type=int, default=0, help="First LCBv6 index to scan.")
     p.add_argument("--num_problems", type=int, default=40, help="How many problems to scan from --start.")
@@ -114,11 +113,14 @@ def main() -> None:
         raise SystemExit("CUDA is not available. Expected Colab L4.")
     set_seed(args.seed)
 
-    print(f"GPU: {torch.cuda.get_device_name(0)} | model: {args.model_name} | thinking: {args.thinking}")
+    domain = get_domain(args.domain)
+
+    print(f"GPU: {torch.cuda.get_device_name(0)} | model: {args.model_name} "
+          f"| domain: {args.domain} | thinking: {args.thinking}")
     output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    lcb = load_lcbv6_split()
+    lcb = domain.load_split()
     start = max(0, min(args.start, len(lcb)))
     end = min(start + args.num_problems, len(lcb))
     tokenizer = _prepare_tokenizer(args.model_name, thinking=args.thinking)
@@ -132,10 +134,10 @@ def main() -> None:
     print("idx | problem_id | difficulty | pass_rate | mean | frontier?")
     for idx in range(start, end):
         row = lcb[idx]
-        pid = row.get("question_id", row.get("problem_id", f"idx_{idx}"))
-        diff = row.get("difficulty", "?")
+        pid = domain.problem_id(row) or f"idx_{idx}"
+        diff = domain.difficulty(row)
         try:
-            r = pass_rate_for(model, tokenizer, row, args.n_samples, args.max_new_tokens)
+            r = pass_rate_for(model, tokenizer, row, args.n_samples, args.max_new_tokens, domain)
         except Exception as exc:
             print(f"{idx} | {pid} | {diff} | ERROR: {exc}")
             results.append({"idx": idx, "problem_id": pid, "difficulty": diff, "error": str(exc)})

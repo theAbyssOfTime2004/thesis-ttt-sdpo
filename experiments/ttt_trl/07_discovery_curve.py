@@ -38,7 +38,9 @@ from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
 # Ensure repo root is importable when this file is executed directly.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from experiments.ttt_trl.evaluator import evaluate_solution, load_lcbv6_split
+from experiments.ttt_trl.domains import Domain, get_domain
+# Re-export so importers (e.g. 09 via importlib) keep finding build_privileged_context here.
+from experiments.ttt_trl.domains import build_privileged_context  # noqa: F401
 
 
 def _filter_supported_kwargs(cls_or_fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -98,57 +100,32 @@ def _prepare_tokenizer(model_name: str, thinking: bool = False):
     return tok
 
 
-def _build_messages(question_content: str) -> list[dict[str, str]]:
-    # Force a code-first answer: the model otherwise rambles for the whole token
-    # budget and never emits a ```python``` block -> reward 0 during training.
-    directive = (
-        "\n\nRespond with ONLY the complete Python solution inside a single "
-        "```python ... ``` block. Do not explain. Read input from stdin, print to stdout."
-    )
-    return [{"role": "user", "content": question_content + directive}]
+def _build_messages(question_content: str, domain: Domain | None = None) -> list[dict[str, str]]:
+    # Force a domain-appropriate answer: the model otherwise rambles for the whole
+    # token budget. The directive is the domain's single source of truth (code =
+    # ```python``` block; math = \boxed{} final answer).
+    if domain is None:
+        domain = get_domain("code")
+    return [{"role": "user", "content": question_content + domain.directive()}]
 
 
-def build_privileged_context(row: dict, max_cases: int = 5, max_len: int = 200) -> str:
-    """
-    Privileged hint for the SDPO teacher (Path B feedback).
-    Uses PUBLIC test cases only (private tests stay for reward scoring -> no leak).
-    The student gets no hint; the teacher sees these expected I/O pairs.
-    """
-    import json
-
-    pts = row.get("public_test_cases") or []
-    # Raw LCBv6 rows store this as a JSON string; parse if needed.
-    if isinstance(pts, str):
-        pts = pts.strip()
-        if not pts:
-            return ""
-        try:
-            pts = json.loads(pts)
-        except Exception:
-            return f"Reference (public tests):\n{pts[:max_len * max_cases]}"
-    if not isinstance(pts, list) or not pts:
-        return ""
-    lines = ["Your solution must satisfy these test cases:"]
-    for t in pts[:max_cases]:
-        if not isinstance(t, dict):
-            continue
-        inp = str(t.get("input", ""))[:max_len]
-        out = str(t.get("output", ""))[:max_len]
-        lines.append(f"- Input: {inp}  ->  Expected: {out}")
-    return "\n".join(lines)
-
-
-def build_dynamic_feedback(solution_code: str, row: dict, max_len: int = 1500) -> str:
+def build_dynamic_feedback(
+    solution_code: str, row: dict, max_len: int = 1500, domain: Domain | None = None
+) -> str:
     """
     REAL environment feedback (Phase 2b): run the model's own attempt through the
     evaluator and return the evaluator's feedback text (which can reveal failure
     modes invisible to public-test hints, e.g. timeouts on large hidden tests).
     This is the verl rich-feedback path (same one baseline multiturn.py consumed).
+
+    For math (leak regime) the feedback reveals the correct answer when wrong.
     """
+    if domain is None:
+        domain = get_domain("code")
     if not solution_code.strip():
         return ""
     try:
-        out = evaluate_solution(solution_code, row, split="train")
+        out = domain.evaluate(solution_code, row, split="train")
     except Exception as exc:
         print(f"[dyn-feedback] evaluation failed: {exc}")
         return ""
@@ -176,27 +153,30 @@ def evaluate_model(
     n_samples: int,
     max_new_tokens: int,
     temperature: float = 1.0,
+    domain: Domain | None = None,
 ) -> dict:
     """
     Generate solutions with `model` and score them on the problem's tests.
     Used for PRE (base model) vs POST (TTT'd model) comparison = effectiveness.
     Returns pass_rate (fraction fully passing), mean/max score, greedy score.
     """
+    if domain is None:
+        domain = get_domain("code")
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
-    question_content = str(row.get("question_content", ""))
+    question_content = domain.problem_text(row)
     prompt_text = tokenizer.apply_chat_template(
-        _build_messages(question_content), add_generation_prompt=True, tokenize=False
+        _build_messages(question_content, domain), add_generation_prompt=True, tokenize=False
     )
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[1]
 
     def _score(code: str) -> float:
         try:
-            return float(evaluate_solution(code, row, split="train")["score"])
+            return float(domain.evaluate(code, row, split="train")["score"])
         except Exception as exc:
             print(f"Eval score error: {exc}")
             return 0.0
@@ -253,10 +233,10 @@ def evaluate_model(
     }
 
 
-def safe_evaluate_model(model, tokenizer, row, n_samples, max_new_tokens, label="") -> dict:
+def safe_evaluate_model(model, tokenizer, row, n_samples, max_new_tokens, label="", domain=None) -> dict:
     """Wrap evaluate_model so a generation failure does not lose training results."""
     try:
-        return evaluate_model(model, tokenizer, row, n_samples, max_new_tokens)
+        return evaluate_model(model, tokenizer, row, n_samples, max_new_tokens, domain=domain)
     except Exception as exc:
         print(f"[{label}] evaluate_model FAILED: {exc}")
         return {
@@ -416,6 +396,8 @@ def _flatten_rewards(step_rewards: list[list[float]]) -> list[float]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 2a discovery curve for TTT-SDPO on one LCBv6 problem.")
+    parser.add_argument("--domain", type=str, default="code", choices=["code", "math"],
+                        help="Task domain: code (LCBv6, default) or math (MATH-500).")
     parser.add_argument("--problem_index", type=int, default=0, help="LCBv6 index (0=abc387_b).")
     parser.add_argument("--max_steps", type=int, default=15, help="TTT steps on the single problem.")
     parser.add_argument("--num_generations", type=int, default=4)
@@ -452,6 +434,8 @@ def main() -> None:
 
     set_seed(args.seed)
 
+    domain = get_domain(args.domain)
+
     device_name = torch.cuda.get_device_name(0)
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"GPU: {device_name}")
@@ -465,18 +449,18 @@ def main() -> None:
 
         wandb.init(
             project=args.wandb_project,
-            name=f"discovery-{args.model_name.split('/')[-1]}-idx{args.problem_index}-{args.max_steps}step-{args.policy_loss_mode}-{args.reprompt_template}",
+            name=f"discovery-{args.model_name.split('/')[-1]}-{args.domain}-idx{args.problem_index}-{args.max_steps}step-{args.policy_loss_mode}-{args.reprompt_template}",
             config=vars(args),
         )
 
     output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    lcb = load_lcbv6_split()
-    row = lcb[args.problem_index]
-    problem_id = row.get("question_id", row.get("problem_id", f"idx_{args.problem_index}"))
-    difficulty = row.get("difficulty", "unknown")
-    question_content = str(row.get("question_content", ""))
+    dataset = domain.load_split()
+    row = dataset[args.problem_index]
+    problem_id = domain.problem_id(row) or f"idx_{args.problem_index}"
+    difficulty = domain.difficulty(row)
+    question_content = domain.problem_text(row)
     print(f"\n=== PROBLEM idx {args.problem_index}: {problem_id} ({difficulty}) ===")
 
     tokenizer = _prepare_tokenizer(args.model_name, thinking=args.thinking)
@@ -495,21 +479,21 @@ def main() -> None:
     )
 
     rendered = tokenizer.apply_chat_template(
-        _build_messages(question_content), add_generation_prompt=True, tokenize=False
+        _build_messages(question_content, domain), add_generation_prompt=True, tokenize=False
     )
     print(f"Prompt preview: {rendered[:180].replace(chr(10), ' ')}")
 
     # ----- PRE-eval (base model, before any TTT) -----
     print(f"\n[PRE-eval] sampling {args.eval_samples} solutions with the base model ...")
-    pre_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="PRE")
+    pre_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="PRE", domain=domain)
     print(f"[PRE-eval] pass_rate={pre_eval['pass_rate']:.3f} "
           f"mean_score={pre_eval['mean_score']:.3f} "
           f"max_score={pre_eval['max_score']:.3f} "
           f"greedy={pre_eval['greedy_score']:.3f} scores={pre_eval['scores']}")
 
-    privileged_context = build_privileged_context(row)
+    privileged_context = domain.privileged_context(row)
     if args.dynamic_feedback:
-        dyn = build_dynamic_feedback(pre_eval.get("greedy_code", ""), row)
+        dyn = build_dynamic_feedback(pre_eval.get("greedy_code", ""), row, domain=domain)
         if dyn:
             privileged_context = (privileged_context + "\n\n" + dyn).strip()
     print(f"Privileged context ({len(privileged_context)} chars): "
@@ -520,7 +504,7 @@ def main() -> None:
     # string approach made training rollouts continue the user text (" below:...")
     # instead of starting a fresh ```python answer like eval does.
     train_dataset = Dataset.from_dict(
-        {"prompt": [_build_messages(question_content)], "privileged_context": [privileged_context]}
+        {"prompt": [_build_messages(question_content, domain)], "privileged_context": [privileged_context]}
     )
 
     problem_dir = output_root / f"problem_{args.problem_index:02d}_{problem_id}"
@@ -550,7 +534,7 @@ def main() -> None:
         for completion in completions:
             code = _extract_text(completion)
             try:
-                out = evaluate_solution(code, row, split="train")
+                out = domain.evaluate(code, row, split="train")
                 rewards.append(float(out["score"]))
             except Exception as exc:
                 print(f"Reward eval error: {exc}")
@@ -601,7 +585,7 @@ def main() -> None:
 
     # ----- POST-eval (TTT'd model) -----
     print(f"\n[POST-eval] sampling {args.eval_samples} solutions with the TTT'd model ...")
-    post_eval = safe_evaluate_model(trainer.model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="POST")
+    post_eval = safe_evaluate_model(trainer.model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="POST", domain=domain)
     print(f"[POST-eval] pass_rate={post_eval['pass_rate']:.3f} "
           f"mean_score={post_eval['mean_score']:.3f} "
           f"max_score={post_eval['max_score']:.3f} "

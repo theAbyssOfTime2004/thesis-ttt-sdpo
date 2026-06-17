@@ -66,7 +66,7 @@ _build_lora_config = _m07._build_lora_config
 _extract_text = _m07._extract_text
 REPROMPT_TEMPLATES = _m07.REPROMPT_TEMPLATES
 
-from experiments.ttt_trl.evaluator import evaluate_solution, load_lcbv6_split
+from experiments.ttt_trl.domains import Domain, get_domain
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +147,7 @@ def _build_teacher_messages(
     option: str,
     max_fewshot: int,
     reprompt_preset: str,
+    domain: Domain | None = None,
 ) -> list[dict[str, str]]:
     formatted_fb, trailing = _apply_reprompt_preset(reprompt_preset, feedback_text)
     fewshot_block = _build_fewshot_block(good_pool, bad_pool, option, max_fewshot)
@@ -159,8 +160,9 @@ def _build_teacher_messages(
     if trailing:
         parts.append(trailing)
     teacher_user = "\n\n".join(p for p in parts if p)
-    # _build_messages appends the standard "Respond with ONLY ... ```python ...```" directive.
-    return _build_messages(teacher_user)
+    # _build_messages appends the domain directive (code = ```python``` block;
+    # math = \boxed{} final answer).
+    return _build_messages(teacher_user, domain)
 
 
 @torch.no_grad()
@@ -179,6 +181,7 @@ def teacher_generate(
     reprompt_preset: str,
     max_prompt_length: int,
     verbose: bool = False,
+    domain: Domain | None = None,
 ) -> tuple[list[str], str]:
     """Sample N teacher completions from prompt + feedback + few-shot exemplars."""
     was_training = model.training
@@ -187,7 +190,8 @@ def teacher_generate(
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     messages = _build_teacher_messages(
-        question_content, feedback_text, good_pool, bad_pool, option, max_fewshot, reprompt_preset
+        question_content, feedback_text, good_pool, bad_pool, option, max_fewshot,
+        reprompt_preset, domain,
     )
     prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
@@ -253,6 +257,7 @@ _PROVIDER_DEFAULT_MODEL = {
     "gemini": "gemini-2.5-flash",
     "groq": "llama-3.3-70b-versatile",
     "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
+    "zai": "glm-4.5-flash",
 }
 
 # Env var(s) holding each provider's API key (first non-empty wins).
@@ -260,12 +265,14 @@ _PROVIDER_ENV = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "groq": ("GROQ_API_KEY",),
     "openrouter": ("OPENROUTER_API_KEY",),
+    "zai": ("ZAI_API_KEY",),
 }
 
 # OpenAI-compatible chat-completions endpoints (gemini uses its own SDK).
 _OPENAI_COMPAT_URL = {
     "groq": "https://api.groq.com/openai/v1/chat/completions",
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+    "zai": "https://api.z.ai/api/paas/v4/chat/completions",
 }
 
 
@@ -315,6 +322,42 @@ CANDIDATE SOLUTION:
 ```python
 {candidate}
 ```
+
+Return ONLY JSON with keys: is_copy (boolean) and reasoning_quality (integer 1-5)."""
+
+
+# MATH judge: string/code similarity is meaningless for short numeric answers.
+# We are in the LEAK regime — the candidate was shown the correct answer via
+# feedback. The judge must decide whether the candidate genuinely DERIVED the
+# answer (step-by-step reasoning, typically inside its <think> block) or just
+# COPIED/stated the leaked answer with no real derivation.
+#   is_copy=true  -> memorized the leaked answer  -> verdict "bad"
+#   is_copy=false -> derived it via real reasoning -> verdict "good"
+# The CANDIDATE text MUST include the candidate's <think> block (thinking-on),
+# since that is where the derivation lives.
+_JUDGE_PROMPT_MATH = """You are judging a CANDIDATE solution to a math problem.
+
+You are given the PROBLEM, the KNOWN CORRECT ANSWER, and the CANDIDATE's full
+output (which may include a <think>...</think> reasoning block followed by a final
+\\boxed{{answer}}). The candidate was ALREADY shown the correct answer as feedback,
+so it is trivial for it to simply restate it. Decide only two things:
+
+  1. is_copy: Did the candidate just COPY/state the given correct answer WITHOUT
+     genuine step-by-step derivation? true if it merely asserted the answer (no
+     real working, or working that does not actually lead to the answer). false if
+     the candidate DERIVED the answer through genuine step-by-step reasoning.
+  2. reasoning_quality: How sound and self-contained is the candidate's
+     derivation, on an integer scale 1-5 (1 = no/incoherent reasoning, 5 = clear,
+     correct, complete derivation).
+
+PROBLEM:
+{problem}
+
+KNOWN CORRECT ANSWER:
+{reference}
+
+CANDIDATE OUTPUT (including any <think> reasoning):
+{candidate}
 
 Return ONLY JSON with keys: is_copy (boolean) and reasoning_quality (integer 1-5)."""
 
@@ -372,14 +415,17 @@ def _call_openai_compat(provider: str, model: str, prompt: str) -> str:
     if not key:
         raise _ProviderError(None, f"{provider}: no API key in env")
     url = _OPENAI_COMPAT_URL[provider]
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        }
-    ).encode("utf-8")
+    payload_body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    if provider == "zai":
+        # z.ai rejects response_format={"type":"json_object"} (HTTP 400). The judge
+        # prompt already enforces "Return ONLY JSON", so drop the field for z.ai.
+        payload_body.pop("response_format", None)
+    body = json.dumps(payload_body).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -441,6 +487,7 @@ def llm_judge(
     provider_models: dict[str, str] | None = None,
     max_retries: int = 4,
     base_delay: float = 2.0,
+    domain: str = "code",
 ) -> dict:
     """
     Ask an LLM whether `candidate_code` is a copy of `reference_code` and how clear
@@ -457,7 +504,10 @@ def llm_judge(
              "raw": <raw json str>, "provider": str, "model": str}.
     verdict good := (not is_copy) and reasoning_quality >= 3.
     """
-    prompt = _JUDGE_PROMPT.format(
+    # MATH: derive-vs-copy judge (reference = known correct answer, candidate =
+    # full output incl <think>). CODE: copy-of-reference-solution judge.
+    template = _JUDGE_PROMPT_MATH if domain == "math" else _JUDGE_PROMPT
+    prompt = template.format(
         problem=problem_text[:8000],  # cap problem text to keep tokens bounded
         reference=reference_code,
         candidate=candidate_code,
@@ -516,6 +566,7 @@ def _cached_llm_judge(
     provider: str = "gemini",
     fallback_providers: list[str] | None = None,
     provider_models: dict[str, str] | None = None,
+    domain: str = "code",
 ) -> dict:
     """
     Judge once per (problem_id, candidate_code). The TTT loop collapses to near-
@@ -528,7 +579,7 @@ def _cached_llm_judge(
     result = llm_judge(
         problem_text, reference_code, candidate_code, model,
         provider=provider, fallback_providers=fallback_providers,
-        provider_models=provider_models,
+        provider_models=provider_models, domain=domain,
     )
     cache[key] = result
     print(f"[llm-judge] problem_id={problem_id} provider={result['provider']} "
@@ -582,6 +633,7 @@ def filter_trajectories(
     judge_provider: str = "gemini",
     judge_fallback_providers: list[str] | None = None,
     judge_provider_models: dict[str, str] | None = None,
+    domain: Domain | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """
     good := correct AND independent ; bad := copy of reference (or wrong in 'none' mode).
@@ -599,11 +651,13 @@ def filter_trajectories(
     """
     if judge_cache is None:
         judge_cache = {}
+    if domain is None:
+        domain = get_domain("code")
     scored: list[tuple[str, float]] = []
     for t in trajectories:
         code = _extract_text(t)
         try:
-            s = float(evaluate_solution(code, row, split="train")["score"])
+            s = float(domain.evaluate(code, row, split="train")["score"])
         except Exception as exc:  # noqa: BLE001
             print(f"[filter] eval error: {exc}")
             s = 0.0
@@ -645,6 +699,7 @@ def filter_trajectories(
                             provider=judge_provider,
                             fallback_providers=judge_fallback_providers,
                             provider_models=judge_provider_models,
+                            domain=domain.name,
                         )["verdict"]
                         judge_calls += 1
                         (good if verdict == "good" else bad).append({"code": code, "score": s})
@@ -813,7 +868,10 @@ def _update_pool(pool: list[dict], new_items: list[dict], cap: int) -> list[dict
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Teacher-first judge-filtered TTT-SDPO (P0: code).")
+    parser = argparse.ArgumentParser(description="Teacher-first judge-filtered TTT-SDPO (code or math).")
+    parser.add_argument("--domain", type=str, default="code", choices=["code", "math"],
+                        help="Task domain: code (LCBv6, default) or math (MATH-500). For math, "
+                             "recommend --reference_mode ground_truth and run WITH --thinking.")
     parser.add_argument("--problem_index", type=int, default=23, help="LCBv6 index (P0 frontier=23).")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--max_steps", type=int, default=15)
@@ -831,11 +889,11 @@ def parse_args() -> argparse.Namespace:
                         help="Independence judge among verifier-correct trajectories: "
                              "difflib (default, current behavior) or llm.")
     parser.add_argument("--judge_provider", type=str, default="gemini",
-                        choices=["gemini", "groq", "openrouter"],
+                        choices=["gemini", "groq", "openrouter", "zai"],
                         help="Primary LLM-judge provider for --judge llm.")
     parser.add_argument("--judge_fallback", type=str, nargs="*",
                         default=["gemini", "groq", "openrouter"],
-                        choices=["gemini", "groq", "openrouter"],
+                        choices=["gemini", "groq", "openrouter", "zai"],
                         help="Fallback providers tried (in order) if the primary is "
                              "quota-exhausted/unavailable; only those with an API key are used. "
                              "Final fallback is always difflib.")
@@ -846,6 +904,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge_openrouter_model", type=str,
                         default="meta-llama/llama-3.3-70b-instruct:free",
                         help="OpenRouter model (when openrouter is used as primary or fallback).")
+    parser.add_argument("--judge_zai_model", type=str, default="glm-4.5-flash",
+                        help="z.ai/GLM model when zai is primary or fallback.")
     parser.add_argument("--kl_topk", type=int, default=20)
     parser.add_argument("--kl_alpha", type=float, default=1.0, help="1.0 = reverse KL (lasgroup LCBv6).")
     parser.add_argument("--reprompt_template", type=str, default="T2_standard",
@@ -873,17 +933,22 @@ def main() -> None:
         raise SystemExit("CUDA is not available. This script requires a GPU (expected Colab L4).")
 
     set_seed(args.seed)
+
+    domain = get_domain(args.domain)
+
     device_name = torch.cuda.get_device_name(0)
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"GPU: {device_name}")
     print(f"Total VRAM: {total_vram_gb:.2f} GB")
-    print(f"Seed: {args.seed} | reference_mode={args.reference_mode} | fewshot={args.fewshot_option}")
+    print(f"Domain: {args.domain} | Seed: {args.seed} | reference_mode={args.reference_mode} "
+          f"| fewshot={args.fewshot_option}")
 
     # Resolve the LLM-judge provider chain once (primary + fallbacks that have keys).
     judge_provider_models = {
         "gemini": args.judge_model,
         "groq": args.judge_groq_model,
         "openrouter": args.judge_openrouter_model,
+        "zai": args.judge_zai_model,
     }
     judge_primary_model = judge_provider_models[args.judge_provider]
     if args.judge == "llm":
@@ -907,7 +972,7 @@ def main() -> None:
 
         wandb.init(
             project=args.wandb_project,
-            name=f"teacherfirst-{args.model_name.split('/')[-1]}-idx{args.problem_index}"
+            name=f"teacherfirst-{args.model_name.split('/')[-1]}-{args.domain}-idx{args.problem_index}"
                  f"-{args.max_steps}step-{args.fewshot_option}-{args.judge}-{args.reprompt_template}",
             config=vars(args),
         )
@@ -915,11 +980,11 @@ def main() -> None:
     output_root = pathlib.Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    lcb = load_lcbv6_split()
+    lcb = domain.load_split()
     row = lcb[args.problem_index]
-    problem_id = row.get("question_id", row.get("problem_id", f"idx_{args.problem_index}"))
-    difficulty = row.get("difficulty", "unknown")
-    question_content = str(row.get("question_content", ""))
+    problem_id = domain.problem_id(row) or f"idx_{args.problem_index}"
+    difficulty = domain.difficulty(row)
+    question_content = domain.problem_text(row)
     print(f"\n=== PROBLEM idx {args.problem_index}: {problem_id} ({difficulty}) ===")
     print(f"[row] keys = {list(row.keys())}")
 
@@ -947,12 +1012,12 @@ def main() -> None:
 
     # ----- PRE-eval (student-only) -----
     print(f"\n[PRE-eval] sampling {args.eval_samples} student solutions ...")
-    pre_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="PRE")
+    pre_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="PRE", domain=domain)
     print(f"[PRE-eval] pass_rate={pre_eval['pass_rate']:.3f} mean={pre_eval['mean_score']:.3f} "
           f"max={pre_eval['max_score']:.3f} greedy={pre_eval['greedy_score']:.3f}")
 
-    base_hint = build_privileged_context(row)
-    student_messages = _build_messages(question_content)
+    base_hint = domain.privileged_context(row)
+    student_messages = _build_messages(question_content, domain)
 
     good_pool: list[dict] = []
     bad_pool: list[dict] = []
@@ -967,8 +1032,8 @@ def main() -> None:
         verbose = step == 0
 
         # Dynamic feedback from the student's CURRENT greedy attempt (reuse 07).
-        greedy_eval = safe_evaluate_model(model, tokenizer, row, 0, args.max_new_tokens, label=f"STEP{step}")
-        dyn = build_dynamic_feedback(greedy_eval.get("greedy_code", ""), row)
+        greedy_eval = safe_evaluate_model(model, tokenizer, row, 0, args.max_new_tokens, label=f"STEP{step}", domain=domain)
+        dyn = build_dynamic_feedback(greedy_eval.get("greedy_code", ""), row, domain=domain)
         feedback_text = "\n\n".join(p for p in [base_hint, dyn] if p).strip()
 
         trajectories, teacher_prompt = teacher_generate(
@@ -976,6 +1041,7 @@ def main() -> None:
             good_pool, bad_pool, args.fewshot_option, args.teacher_n,
             args.teacher_temperature, args.max_new_tokens, args.max_fewshot,
             args.reprompt_template, args.max_prompt_length, verbose=verbose,
+            domain=domain,
         )
 
         good, bad, stats = filter_trajectories(
@@ -985,6 +1051,7 @@ def main() -> None:
             judge_provider=args.judge_provider,
             judge_fallback_providers=args.judge_fallback,
             judge_provider_models=judge_provider_models,
+            domain=domain,
         )
         good_pool = _update_pool(good_pool, good, args.pool_cap)
         bad_pool = _update_pool(bad_pool, bad, args.pool_cap)
@@ -992,7 +1059,7 @@ def main() -> None:
         if good:
             teacher_messages = _build_teacher_messages(
                 question_content, feedback_text, good_pool, bad_pool,
-                args.fewshot_option, args.max_fewshot, args.reprompt_template,
+                args.fewshot_option, args.max_fewshot, args.reprompt_template, domain,
             )
             model.train()
             loss = teacher_first_step(
@@ -1030,7 +1097,7 @@ def main() -> None:
 
     # ----- POST-eval (student-only) -----
     print(f"\n[POST-eval] sampling {args.eval_samples} student solutions ...")
-    post_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="POST")
+    post_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="POST", domain=domain)
     print(f"[POST-eval] pass_rate={post_eval['pass_rate']:.3f} mean={post_eval['mean_score']:.3f} "
           f"max={post_eval['max_score']:.3f} greedy={post_eval['greedy_score']:.3f}")
 

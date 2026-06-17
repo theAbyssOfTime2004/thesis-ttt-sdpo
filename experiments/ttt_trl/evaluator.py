@@ -115,3 +115,49 @@ def evaluate_solution(
         "n_passed": n_passed,
         "details": result,
     }
+
+
+def load_math_split():
+    """
+    Load the MATH-500 test split.
+
+    Fields per row: problem (str), answer (str, ground-truth), solution (str),
+    subject (str), level (int 1-5), unique_id (str).
+    """
+    return load_dataset("HuggingFaceH4/MATH-500", split="test")
+
+
+def evaluate_solution_math(
+    solution_text: str,
+    row: dict,
+    split: str = "train",
+) -> dict:
+    """
+    Score a math solution against a MATH-500 row's ground-truth answer.
+
+    The reward is BINARY (0.0/1.0), not a dense pass-ratio (unlike the code path).
+    `correctness_feedback=True` puts us in the LEAK regime: when the answer is
+    wrong, the returned feedback reveals the correct answer.
+
+    Returns the SAME shape as the code `evaluate_solution`:
+        {"score": float, "n_total": 1, "n_passed": int(score), "details": result}
+    where `details` is the raw math.compute_score dict (contains "feedback").
+    """
+    # Lazy import: math.py pulls in math_verify at module load. Keeping it lazy
+    # means the code domain path never requires math_verify to be installed.
+    from verl.utils.reward_score.feedback import math as math_reward
+
+    result = math_reward.compute_score(
+        solution_str=solution_text,
+        ground_truth=str(row["answer"]),
+        extra_info={"split": split, "truncated": False},
+        correctness_feedback=True,  # leak regime: feedback reveals the answer
+    )
+
+    score_value = float(result.get("score", 0.0))
+    return {
+        "score": score_value,
+        "n_total": 1,
+        "n_passed": int(score_value),
+        "details": result,
+    }
