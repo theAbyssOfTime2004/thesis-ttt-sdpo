@@ -127,6 +127,36 @@ def load_math_split():
     return load_dataset("HuggingFaceH4/MATH-500", split="test")
 
 
+def _normalize_math_answer(s: str) -> str:
+    """
+    Strip LaTeX-cosmetic noise so two expressions that differ only in presentation
+    compare equal. Conservative: only removes formatting that never changes the
+    mathematical value (sizing, spacing, display directives, frac aliases).
+
+    e.g. r"\\left( 3, \\frac{\\pi}{2} \\right)" and r"(3, \\frac{\\pi}{2})"
+         both normalize to "(3,\\frac{\\pi}{2})".
+    """
+    import re
+
+    s = str(s).strip()
+    # Drop surrounding math delimiters.
+    s = s.replace("$", "")
+    # Sizing wrappers: \left( \right) \bigl \bigr ...
+    s = re.sub(r"\\(left|right|bigl|bigr|Bigl|Bigr|biggl|biggr|Biggl|Biggr|big|Big|bigg|Bigg)\b", "", s)
+    # frac aliases -> \frac (value-identical).
+    s = re.sub(r"\\[dt]frac\b", r"\\frac", s)
+    # Display / text directives that carry no value.
+    s = re.sub(r"\\(displaystyle|textstyle|scriptstyle|mathrm|text|mbox)\b", "", s)
+    # LaTeX spacing commands.
+    s = re.sub(r"\\[,;:! ]", "", s)
+    s = re.sub(r"\\(quad|qquad)\b", "", s)
+    # Trailing units like "\\text{ degrees}" already stripped; drop remaining braces-spaces.
+    s = re.sub(r"\s+", "", s)
+    # Cosmetic-only trailing period.
+    s = s.rstrip(".")
+    return s
+
+
 def evaluate_solution_math(
     solution_text: str,
     row: dict,
@@ -142,19 +172,36 @@ def evaluate_solution_math(
     Returns the SAME shape as the code `evaluate_solution`:
         {"score": float, "n_total": 1, "n_passed": int(score), "details": result}
     where `details` is the raw math.compute_score dict (contains "feedback").
+
+    FALLBACK (math.py is left untouched per spec): math_verify cannot match
+    tuple/coordinate/interval/set answers like r"\\left( 3, \\frac{\\pi}{2} \\right)"
+    vs r"(3, \\frac{\\pi}{2})", producing false negatives that wreck the frontier
+    scan. So when math.py scores 0 but a boxed answer WAS extracted, we retry with
+    a conservative LaTeX-cosmetic normalization and only flip 0 -> 1 on an exact
+    normalized match (negligible false-positive risk).
     """
     # Lazy import: math.py pulls in math_verify at module load. Keeping it lazy
     # means the code domain path never requires math_verify to be installed.
     from verl.utils.reward_score.feedback import math as math_reward
 
+    ground_truth = str(row["answer"])
     result = math_reward.compute_score(
         solution_str=solution_text,
-        ground_truth=str(row["answer"]),
+        ground_truth=ground_truth,
         extra_info={"split": split, "truncated": False},
         correctness_feedback=True,  # leak regime: feedback reveals the answer
     )
 
     score_value = float(result.get("score", 0.0))
+
+    if score_value < 1.0:
+        pred = result.get("pred") or ""
+        if pred and _normalize_math_answer(pred) == _normalize_math_answer(ground_truth):
+            score_value = 1.0
+            # Keep the raw dict but record the override for transparency/logging.
+            result = {**result, "score": 1.0, "acc": 1.0, "normalized_match": True,
+                      "feedback": ""}
+
     return {
         "score": score_value,
         "n_total": 1,
