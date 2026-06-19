@@ -170,6 +170,44 @@ def _normalize_math_answer(s: str) -> str:
     return s
 
 
+def _is_integer_ground_truth(ground_truth: str) -> bool:
+    """True when answer is a plain integer (AIME-style); MATH-500 symbolic answers stay False."""
+    import re
+
+    return bool(re.fullmatch(r"-?\d+", str(ground_truth).strip()))
+
+
+def _extract_integer_answer_from_completion(text: str) -> int | None:
+    """
+    Conservative trailing-integer extraction for AIME when \\boxed{} is missing.
+    Prefers explicit answer phrases, then full-text \\boxed{digits}, then last integer.
+    """
+    import re
+
+    if not text.strip():
+        return None
+
+    # Full-text boxed integer (math.py only scans the last 100 chars).
+    boxed = list(re.finditer(r"\\boxed\{(-?\d+)\}", text))
+    if boxed:
+        return int(boxed[-1].group(1))
+
+    phrase_patterns = [
+        r"(?:final\s+answer|the\s+answer\s+is|answer\s+is)\s*[:=]?\s*(-?\d+)",
+        r"=\s*(-?\d+)\s*(?:\.|,|\n|$)",
+    ]
+    for pat in phrase_patterns:
+        matches = list(re.finditer(pat, text, re.IGNORECASE | re.MULTILINE))
+        if matches:
+            return int(matches[-1].group(1))
+
+    # Last standalone integer in the completion (AIME answers are 0–999).
+    ints = re.findall(r"(?<![.\d])(-?\d+)(?![.\d])", text)
+    if ints:
+        return int(ints[-1])
+    return None
+
+
 def evaluate_solution_math(
     solution_text: str,
     row: dict,
@@ -192,6 +230,11 @@ def evaluate_solution_math(
     scan. So when math.py scores 0 but a boxed answer WAS extracted, we retry with
     a conservative LaTeX-cosmetic normalization and only flip 0 -> 1 on an exact
     normalized match (negligible false-positive risk).
+
+    INTEGER-ANSWER fallback (AIME only): when ground_truth is a plain integer and
+    math.py scores 0 with empty/missing \\boxed{} (incorrect_format), extract the
+    stated integer from the completion (phrase patterns, then last integer) and
+    flip 0 -> 1 only on an exact int match. MATH-500 symbolic answers skip this.
     """
     # Lazy import: math.py pulls in math_verify at module load. Keeping it lazy
     # means the code domain path never requires math_verify to be installed.
@@ -214,6 +257,20 @@ def evaluate_solution_math(
             # Keep the raw dict but record the override for transparency/logging.
             result = {**result, "score": 1.0, "acc": 1.0, "normalized_match": True,
                       "feedback": ""}
+        elif _is_integer_ground_truth(ground_truth) and (
+            not pred or bool(result.get("incorrect_format"))
+        ):
+            extracted = _extract_integer_answer_from_completion(solution_text)
+            if extracted is not None and extracted == int(ground_truth.strip()):
+                score_value = 1.0
+                result = {
+                    **result,
+                    "score": 1.0,
+                    "acc": 1.0,
+                    "integer_match": True,
+                    "pred": str(extracted),
+                    "feedback": "",
+                }
 
     return {
         "score": score_value,

@@ -35,7 +35,8 @@ _CODE_DIRECTIVE = (
 # MATH directive: MUST allow reasoning (do NOT say "do not explain"; thinking needs it).
 _MATH_DIRECTIVE = (
     "\n\nSolve the problem. Reason step by step, then give the final answer as "
-    "\\boxed{your_answer}."
+    "\\boxed{your_answer}. You MUST give the final answer as \\boxed{N}. "
+    "Do not state it any other way."
 )
 
 
