@@ -11,6 +11,7 @@ No training — just PRE-eval each problem with N samples and report pass rate.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import pathlib
@@ -20,66 +21,57 @@ import sys
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from transformers import tokenization_utils_base
-from transformers.utils import hub as hub_utils
+from transformers import AutoModelForCausalLM, set_seed
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from experiments.ttt_trl.domains import get_domain
 
-
-def _prepare_tokenizer(model_name: str, thinking: bool = False):
-    original_list_repo_templates = hub_utils.list_repo_templates
-
-    def _safe_list_repo_templates(*args, **kwargs):
-        try:
-            return original_list_repo_templates(*args, **kwargs)
-        except Exception:
-            return []
-
-    hub_utils.list_repo_templates = _safe_list_repo_templates
-    tokenization_utils_base.list_repo_templates = _safe_list_repo_templates
-    tok = AutoTokenizer.from_pretrained(model_name)
-
-    if not thinking:
-        _orig_apply = tok.apply_chat_template
-
-        def _no_think_apply(*a, **kw):
-            kw.setdefault("enable_thinking", False)
-            try:
-                return _orig_apply(*a, **kw)
-            except TypeError:
-                kw.pop("enable_thinking", None)
-                return _orig_apply(*a, **kw)
-
-        tok.apply_chat_template = _no_think_apply
-    return tok
+# Reuse 07 tokenizer / message helpers (Gemma-4 <|think|> vs Qwen enable_thinking).
+_m07 = importlib.import_module("experiments.ttt_trl.07_discovery_curve")
+_prepare_tokenizer = _m07._prepare_tokenizer
+_build_messages = _m07._build_messages
 
 
 @torch.no_grad()
-def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens, domain, debug=False) -> dict:
+def pass_rate_for(
+    model,
+    tokenizer,
+    row,
+    n_samples,
+    max_new_tokens,
+    domain,
+    model_name: str = "",
+    thinking: bool = False,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    debug: bool = False,
+) -> dict:
     device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     question_content = domain.problem_text(row)
-    # Match 07's directive so scan pass-rates are consistent with the TTT runs.
+    # Match 07's directive + model-family thinking so scan pass-rates align with TTT runs.
     prompt_text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": question_content + domain.directive()}],
-        add_generation_prompt=True, tokenize=False,
+        _build_messages(question_content, domain, model_name, thinking),
+        add_generation_prompt=True,
+        tokenize=False,
     )
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[1]
 
-    out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=1.0,
-        top_p=1.0,
-        num_return_sequences=n_samples,
-        use_cache=True,
-        pad_token_id=pad_id,
-    )
+    sample_kwargs: dict = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": top_p,
+        "num_return_sequences": n_samples,
+        "use_cache": True,
+        "pad_token_id": pad_id,
+    }
+    if top_k > 0:
+        sample_kwargs["top_k"] = top_k
+
+    out = model.generate(**inputs, **sample_kwargs)
     scores = []
     for i in range(out.shape[0]):
         gen_ids = out[i, prompt_len:]
@@ -113,15 +105,19 @@ def pass_rate_for(model, tokenizer, row, n_samples, max_new_tokens, domain, debu
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Scan LCBv6 for frontier problems (one-shot pass rate in (0,1)).")
-    p.add_argument("--domain", type=str, default="code", choices=["code", "math"],
-                   help="Task domain: code (LCBv6, default) or math (MATH-500). "
-                        "For math, run WITH --thinking and high --max_new_tokens.")
+    p.add_argument("--domain", type=str, default="code", choices=["code", "math", "aime"],
+                   help="Task domain: code (LCBv6), math (MATH-500), or aime (AIME 2026). "
+                        "For math/aime, run WITH --thinking and high --max_new_tokens.")
     p.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
     p.add_argument("--start", type=int, default=0, help="First LCBv6 index to scan.")
     p.add_argument("--num_problems", type=int, default=40, help="How many problems to scan from --start.")
     p.add_argument("--n_samples", type=int, default=4)
     p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--thinking", action="store_true")
+    p.add_argument("--top_p", type=float, default=1.0,
+                   help="Sampling top_p (Gemma-4 card recommends 0.95; default 1.0 = Qwen behavior).")
+    p.add_argument("--top_k", type=int, default=0,
+                   help="Sampling top_k (0 = omit; Gemma-4 card recommends 64).")
     p.add_argument("--debug", action="store_true",
                    help="Print per-problem sample[0]: ground-truth vs extracted answer, "
                         "token count / truncation, and last 300 chars of the completion.")
@@ -160,7 +156,11 @@ def main() -> None:
         pid = domain.problem_id(row) or f"idx_{idx}"
         diff = domain.difficulty(row)
         try:
-            r = pass_rate_for(model, tokenizer, row, args.n_samples, args.max_new_tokens, domain, debug=args.debug)
+            r = pass_rate_for(
+                model, tokenizer, row, args.n_samples, args.max_new_tokens, domain,
+                model_name=args.model_name, thinking=args.thinking,
+                top_p=args.top_p, top_k=args.top_k, debug=args.debug,
+            )
         except Exception as exc:
             print(f"{idx} | {pid} | {diff} | ERROR: {exc}")
             results.append({"idx": idx, "problem_id": pid, "difficulty": diff, "error": str(exc)})

@@ -148,6 +148,8 @@ def _build_teacher_messages(
     max_fewshot: int,
     reprompt_preset: str,
     domain: Domain | None = None,
+    model_name: str = "",
+    thinking: bool = False,
 ) -> list[dict[str, str]]:
     formatted_fb, trailing = _apply_reprompt_preset(reprompt_preset, feedback_text)
     fewshot_block = _build_fewshot_block(good_pool, bad_pool, option, max_fewshot)
@@ -161,8 +163,8 @@ def _build_teacher_messages(
         parts.append(trailing)
     teacher_user = "\n\n".join(p for p in parts if p)
     # _build_messages appends the domain directive (code = ```python``` block;
-    # math = \boxed{} final answer).
-    return _build_messages(teacher_user, domain)
+    # math = \boxed{} final answer) and Gemma-4 <|think|> system when needed.
+    return _build_messages(teacher_user, domain, model_name, thinking)
 
 
 @torch.no_grad()
@@ -182,6 +184,10 @@ def teacher_generate(
     max_prompt_length: int,
     verbose: bool = False,
     domain: Domain | None = None,
+    model_name: str = "",
+    thinking: bool = False,
+    top_p: float = 1.0,
+    top_k: int = 0,
 ) -> tuple[list[str], str]:
     """Sample N teacher completions from prompt + feedback + few-shot exemplars."""
     was_training = model.training
@@ -191,7 +197,7 @@ def teacher_generate(
 
     messages = _build_teacher_messages(
         question_content, feedback_text, good_pool, bad_pool, option, max_fewshot,
-        reprompt_preset, domain,
+        reprompt_preset, domain, model_name, thinking,
     )
     prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
@@ -206,16 +212,18 @@ def teacher_generate(
 
     completions: list[str] = []
     if n > 0:
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=1.0,
-            num_return_sequences=n,
-            use_cache=True,
-            pad_token_id=pad_id,
-        )
+        sample_kwargs: dict = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": True,
+            "temperature": temperature,
+            "top_p": top_p,
+            "num_return_sequences": n,
+            "use_cache": True,
+            "pad_token_id": pad_id,
+        }
+        if top_k > 0:
+            sample_kwargs["top_k"] = top_k
+        out = model.generate(**inputs, **sample_kwargs)
         for i in range(out.shape[0]):
             completions.append(tokenizer.decode(out[i, prompt_tokens:], skip_special_tokens=True))
 
@@ -506,7 +514,7 @@ def llm_judge(
     """
     # MATH: derive-vs-copy judge (reference = known correct answer, candidate =
     # full output incl <think>). CODE: copy-of-reference-solution judge.
-    template = _JUDGE_PROMPT_MATH if domain == "math" else _JUDGE_PROMPT
+    template = _JUDGE_PROMPT_MATH if domain in ("math", "aime") else _JUDGE_PROMPT
     prompt = template.format(
         problem=problem_text[:8000],  # cap problem text to keep tokens bounded
         reference=reference_code,
@@ -869,14 +877,18 @@ def _update_pool(pool: list[dict], new_items: list[dict], cap: int) -> list[dict
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Teacher-first judge-filtered TTT-SDPO (code or math).")
-    parser.add_argument("--domain", type=str, default="code", choices=["code", "math"],
-                        help="Task domain: code (LCBv6, default) or math (MATH-500). For math, "
-                             "recommend --reference_mode ground_truth and run WITH --thinking.")
+    parser.add_argument("--domain", type=str, default="code", choices=["code", "math", "aime"],
+                        help="Task domain: code (LCBv6), math (MATH-500), or aime (AIME 2026). "
+                             "For math/aime, recommend --reference_mode ground_truth and --thinking.")
     parser.add_argument("--problem_index", type=int, default=23, help="LCBv6 index (P0 frontier=23).")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--max_steps", type=int, default=15)
     parser.add_argument("--teacher_n", type=int, default=10, help="Teacher samples per step.")
     parser.add_argument("--teacher_temperature", type=float, default=1.0)
+    parser.add_argument("--top_p", type=float, default=1.0,
+                        help="Sampling top_p (Gemma-4 card recommends 0.95; default 1.0 = Qwen behavior).")
+    parser.add_argument("--top_k", type=int, default=0,
+                        help="Sampling top_k (0 = omit; Gemma-4 card recommends 64).")
     parser.add_argument("--sim_threshold", type=float, default=0.9)
     parser.add_argument("--fewshot_option", type=str, default="good_only",
                         choices=["good_only", "good_bad"])
@@ -1012,12 +1024,16 @@ def main() -> None:
 
     # ----- PRE-eval (student-only) -----
     print(f"\n[PRE-eval] sampling {args.eval_samples} student solutions ...")
-    pre_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="PRE", domain=domain)
+    pre_eval = safe_evaluate_model(
+        model, tokenizer, row, args.eval_samples, args.max_new_tokens,
+        label="PRE", domain=domain, model_name=args.model_name, thinking=args.thinking,
+        top_p=args.top_p, top_k=args.top_k,
+    )
     print(f"[PRE-eval] pass_rate={pre_eval['pass_rate']:.3f} mean={pre_eval['mean_score']:.3f} "
           f"max={pre_eval['max_score']:.3f} greedy={pre_eval['greedy_score']:.3f}")
 
     base_hint = domain.privileged_context(row)
-    student_messages = _build_messages(question_content, domain)
+    student_messages = _build_messages(question_content, domain, args.model_name, args.thinking)
 
     good_pool: list[dict] = []
     bad_pool: list[dict] = []
@@ -1032,7 +1048,12 @@ def main() -> None:
         verbose = step == 0
 
         # Dynamic feedback from the student's CURRENT greedy attempt (reuse 07).
-        greedy_eval = safe_evaluate_model(model, tokenizer, row, 0, args.max_new_tokens, label=f"STEP{step}", domain=domain)
+        greedy_eval = safe_evaluate_model(
+            model, tokenizer, row, 0, args.max_new_tokens,
+            label=f"STEP{step}", domain=domain,
+            model_name=args.model_name, thinking=args.thinking,
+            top_p=args.top_p, top_k=args.top_k,
+        )
         dyn = build_dynamic_feedback(greedy_eval.get("greedy_code", ""), row, domain=domain)
         feedback_text = "\n\n".join(p for p in [base_hint, dyn] if p).strip()
 
@@ -1041,7 +1062,8 @@ def main() -> None:
             good_pool, bad_pool, args.fewshot_option, args.teacher_n,
             args.teacher_temperature, args.max_new_tokens, args.max_fewshot,
             args.reprompt_template, args.max_prompt_length, verbose=verbose,
-            domain=domain,
+            domain=domain, model_name=args.model_name, thinking=args.thinking,
+            top_p=args.top_p, top_k=args.top_k,
         )
 
         good, bad, stats = filter_trajectories(
@@ -1060,6 +1082,7 @@ def main() -> None:
             teacher_messages = _build_teacher_messages(
                 question_content, feedback_text, good_pool, bad_pool,
                 args.fewshot_option, args.max_fewshot, args.reprompt_template, domain,
+                args.model_name, args.thinking,
             )
             model.train()
             loss = teacher_first_step(
@@ -1097,7 +1120,11 @@ def main() -> None:
 
     # ----- POST-eval (student-only) -----
     print(f"\n[POST-eval] sampling {args.eval_samples} student solutions ...")
-    post_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="POST", domain=domain)
+    post_eval = safe_evaluate_model(
+        model, tokenizer, row, args.eval_samples, args.max_new_tokens,
+        label="POST", domain=domain, model_name=args.model_name, thinking=args.thinking,
+        top_p=args.top_p, top_k=args.top_k,
+    )
     print(f"[POST-eval] pass_rate={post_eval['pass_rate']:.3f} mean={post_eval['mean_score']:.3f} "
           f"max={post_eval['max_score']:.3f} greedy={post_eval['greedy_score']:.3f}")
 

@@ -65,6 +65,12 @@ def _extract_text(completion: Any) -> str:
     return str(completion)
 
 
+def _is_gemma4_model(model_name: str) -> bool:
+    """Gemma-4 uses <|think|> in system for thinking — not Qwen's enable_thinking kwarg."""
+    name = model_name.lower()
+    return "gemma-4" in name or "gemma4" in name
+
+
 def _prepare_tokenizer(model_name: str, thinking: bool = False):
     # Some repos do not expose `additional_chat_templates/`; treat it as optional.
     original_list_repo_templates = hub_utils.list_repo_templates
@@ -78,6 +84,11 @@ def _prepare_tokenizer(model_name: str, thinking: bool = False):
     hub_utils.list_repo_templates = _safe_list_repo_templates
     tokenization_utils_base.list_repo_templates = _safe_list_repo_templates
     tok = AutoTokenizer.from_pretrained(model_name)
+
+    if _is_gemma4_model(model_name):
+        # Gemma-4 thinking is toggled via <|think|> in the system turn (_build_messages).
+        # Do NOT pass enable_thinking to apply_chat_template.
+        return tok
 
     if not thinking:
         # Qwen3 enables thinking by default -> long <think> blocks eat the token
@@ -100,13 +111,25 @@ def _prepare_tokenizer(model_name: str, thinking: bool = False):
     return tok
 
 
-def _build_messages(question_content: str, domain: Domain | None = None) -> list[dict[str, str]]:
+def _build_messages(
+    question_content: str,
+    domain: Domain | None = None,
+    model_name: str = "",
+    thinking: bool = False,
+) -> list[dict[str, str]]:
     # Force a domain-appropriate answer: the model otherwise rambles for the whole
     # token budget. The directive is the domain's single source of truth (code =
     # ```python``` block; math = \boxed{} final answer).
     if domain is None:
         domain = get_domain("code")
-    return [{"role": "user", "content": question_content + domain.directive()}]
+    user_content = question_content + domain.directive()
+    if _is_gemma4_model(model_name) and thinking:
+        # Gemma-4: <|think|> in system triggers thinking mode (not enable_thinking).
+        return [
+            {"role": "system", "content": "<|think|>"},
+            {"role": "user", "content": user_content},
+        ]
+    return [{"role": "user", "content": user_content}]
 
 
 def build_dynamic_feedback(
@@ -154,6 +177,10 @@ def evaluate_model(
     max_new_tokens: int,
     temperature: float = 1.0,
     domain: Domain | None = None,
+    model_name: str = "",
+    thinking: bool = False,
+    top_p: float = 1.0,
+    top_k: int = 0,
 ) -> dict:
     """
     Generate solutions with `model` and score them on the problem's tests.
@@ -169,7 +196,9 @@ def evaluate_model(
 
     question_content = domain.problem_text(row)
     prompt_text = tokenizer.apply_chat_template(
-        _build_messages(question_content, domain), add_generation_prompt=True, tokenize=False
+        _build_messages(question_content, domain, model_name, thinking),
+        add_generation_prompt=True,
+        tokenize=False,
     )
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len = inputs["input_ids"].shape[1]
@@ -181,18 +210,24 @@ def evaluate_model(
             print(f"Eval score error: {exc}")
             return 0.0
 
+    sample_kwargs: dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": top_p,
+        "use_cache": True,
+        "pad_token_id": pad_id,
+    }
+    if top_k > 0:
+        sample_kwargs["top_k"] = top_k
+
     # Sampled solutions (batched via num_return_sequences).
     scores: list[float] = []
     if n_samples > 0:
         out = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=1.0,
             num_return_sequences=n_samples,
-            use_cache=True,
-            pad_token_id=pad_id,
+            **sample_kwargs,
         )
         for i in range(out.shape[0]):
             code = tokenizer.decode(out[i, prompt_len:], skip_special_tokens=True)
@@ -233,10 +268,26 @@ def evaluate_model(
     }
 
 
-def safe_evaluate_model(model, tokenizer, row, n_samples, max_new_tokens, label="", domain=None) -> dict:
+def safe_evaluate_model(
+    model,
+    tokenizer,
+    row,
+    n_samples,
+    max_new_tokens,
+    label="",
+    domain=None,
+    model_name="",
+    thinking=False,
+    top_p=1.0,
+    top_k=0,
+) -> dict:
     """Wrap evaluate_model so a generation failure does not lose training results."""
     try:
-        return evaluate_model(model, tokenizer, row, n_samples, max_new_tokens, domain=domain)
+        return evaluate_model(
+            model, tokenizer, row, n_samples, max_new_tokens,
+            domain=domain, model_name=model_name, thinking=thinking,
+            top_p=top_p, top_k=top_k,
+        )
     except Exception as exc:
         print(f"[{label}] evaluate_model FAILED: {exc}")
         return {
@@ -308,7 +359,16 @@ def _build_sdpo_config(
     thinking: bool = False,
     reprompt_template: str = "T2_standard",
     report_to: str = "none",
+    model_name: str = "",
+    top_p: float = 1.0,
+    top_k: int = 0,
 ) -> SDPOConfig:
+    generation_kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens, "max_time": 2400.0}
+    if top_p != 1.0:
+        generation_kwargs["top_p"] = top_p
+    if top_k > 0:
+        generation_kwargs["top_k"] = top_k
+
     requested = {
         "output_dir": str(problem_output_dir),
         "per_device_train_batch_size": 1,
@@ -326,7 +386,7 @@ def _build_sdpo_config(
         # max_time must comfortably exceed the time to generate max_new_tokens
         # (8B + thinking 20k tokens needs 15-20 min). 600s silently truncated
         # mid-think -> all-zero training rewards while eval (no max_time) scored.
-        "generation_kwargs": {"max_new_tokens": max_new_tokens, "max_time": 2400.0},
+        "generation_kwargs": generation_kwargs,
         # Thinking-off must reach the TRAINER's internal rendering, not just our
         # eval. The monkey-patch on tok.apply_chat_template did NOT propagate to
         # the student-rollout prompt (GRPOTrainer renders via the trl
@@ -335,7 +395,10 @@ def _build_sdpo_config(
         # (grpo_trainer line 1951) AND teacher reprompt tokenization. Without it
         # Qwen3 emits <think> blocks, blows the token budget, never produces a
         # ```python``` block -> every training rollout scores 0 (the artifact).
-        "chat_template_kwargs": {"enable_thinking": thinking},
+        # Gemma-4: thinking via <|think|> in system (_build_messages); omit kwarg.
+        "chat_template_kwargs": (
+            {} if _is_gemma4_model(model_name) else {"enable_thinking": thinking}
+        ),
         "gradient_checkpointing": True,
         # Logit-level top-k SDPO (paper: logit > token > sequence), reverse KL.
         # Old TRL (<=1.5) names AND new TRL 1.6 names both included; the
@@ -396,8 +459,8 @@ def _flatten_rewards(step_rewards: list[list[float]]) -> list[float]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 2a discovery curve for TTT-SDPO on one LCBv6 problem.")
-    parser.add_argument("--domain", type=str, default="code", choices=["code", "math"],
-                        help="Task domain: code (LCBv6, default) or math (MATH-500).")
+    parser.add_argument("--domain", type=str, default="code", choices=["code", "math", "aime"],
+                        help="Task domain: code (LCBv6), math (MATH-500), or aime (AIME 2026).")
     parser.add_argument("--problem_index", type=int, default=0, help="LCBv6 index (0=abc387_b).")
     parser.add_argument("--max_steps", type=int, default=15, help="TTT steps on the single problem.")
     parser.add_argument("--num_generations", type=int, default=4)
@@ -405,7 +468,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--thinking", action="store_true",
-                        help="Enable Qwen3 thinking mode (default off; needs much higher max_new_tokens).")
+                        help="Enable thinking mode (Qwen: enable_thinking; Gemma-4: <|think|> in system).")
+    parser.add_argument("--top_p", type=float, default=1.0,
+                        help="Sampling top_p (Gemma-4 card recommends 0.95; default 1.0 = Qwen behavior).")
+    parser.add_argument("--top_k", type=int, default=0,
+                        help="Sampling top_k (0 = omit; Gemma-4 card recommends 64).")
     parser.add_argument("--eval_samples", type=int, default=8, help="Samples for pre/post eval.")
     parser.add_argument("--policy_loss_mode", type=str, default="hybrid",
                         choices=["hybrid", "distillation_only"],
@@ -479,13 +546,19 @@ def main() -> None:
     )
 
     rendered = tokenizer.apply_chat_template(
-        _build_messages(question_content, domain), add_generation_prompt=True, tokenize=False
+        _build_messages(question_content, domain, args.model_name, args.thinking),
+        add_generation_prompt=True,
+        tokenize=False,
     )
     print(f"Prompt preview: {rendered[:180].replace(chr(10), ' ')}")
 
     # ----- PRE-eval (base model, before any TTT) -----
     print(f"\n[PRE-eval] sampling {args.eval_samples} solutions with the base model ...")
-    pre_eval = safe_evaluate_model(model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="PRE", domain=domain)
+    pre_eval = safe_evaluate_model(
+        model, tokenizer, row, args.eval_samples, args.max_new_tokens,
+        label="PRE", domain=domain, model_name=args.model_name, thinking=args.thinking,
+        top_p=args.top_p, top_k=args.top_k,
+    )
     print(f"[PRE-eval] pass_rate={pre_eval['pass_rate']:.3f} "
           f"mean_score={pre_eval['mean_score']:.3f} "
           f"max_score={pre_eval['max_score']:.3f} "
@@ -504,7 +577,10 @@ def main() -> None:
     # string approach made training rollouts continue the user text (" below:...")
     # instead of starting a fresh ```python answer like eval does.
     train_dataset = Dataset.from_dict(
-        {"prompt": [_build_messages(question_content, domain)], "privileged_context": [privileged_context]}
+        {
+            "prompt": [_build_messages(question_content, domain, args.model_name, args.thinking)],
+            "privileged_context": [privileged_context],
+        }
     )
 
     problem_dir = output_root / f"problem_{args.problem_index:02d}_{problem_id}"
@@ -519,6 +595,9 @@ def main() -> None:
         thinking=args.thinking,
         reprompt_template=args.reprompt_template,
         report_to=report_to,
+        model_name=args.model_name,
+        top_p=args.top_p,
+        top_k=args.top_k,
     )
 
     reward_history: list[list[float]] = []
@@ -585,7 +664,11 @@ def main() -> None:
 
     # ----- POST-eval (TTT'd model) -----
     print(f"\n[POST-eval] sampling {args.eval_samples} solutions with the TTT'd model ...")
-    post_eval = safe_evaluate_model(trainer.model, tokenizer, row, args.eval_samples, args.max_new_tokens, label="POST", domain=domain)
+    post_eval = safe_evaluate_model(
+        trainer.model, tokenizer, row, args.eval_samples, args.max_new_tokens,
+        label="POST", domain=domain, model_name=args.model_name, thinking=args.thinking,
+        top_p=args.top_p, top_k=args.top_k,
+    )
     print(f"[POST-eval] pass_rate={post_eval['pass_rate']:.3f} "
           f"mean_score={post_eval['mean_score']:.3f} "
           f"max_score={post_eval['max_score']:.3f} "

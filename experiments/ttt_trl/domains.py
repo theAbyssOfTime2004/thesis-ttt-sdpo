@@ -1,9 +1,10 @@
 """
 Domain dispatch (single source of truth) for the TTT-SDPO scripts 07/08/09.
 
-Two task domains are supported, selectable via `--domain {code,math}`:
+Task domains, selectable via `--domain {code,math,aime}`:
   - code: LiveCodeBench v6 (LCBv6), dense pass-ratio reward.
   - math: MATH-500, binary (0.0/1.0) reward.
+  - aime: AIME 2026 (MathArena), binary reward (reuses math evaluator).
 
 Each domain exposes a uniform interface so the scripts route problem loading,
 prompt construction, scoring, and logging through one place. The CODE domain
@@ -18,6 +19,7 @@ from typing import Any
 from experiments.ttt_trl.evaluator import (
     evaluate_solution,
     evaluate_solution_math,
+    load_aime_split,
     load_lcbv6_split,
     load_math_split,
 )
@@ -155,9 +157,39 @@ class MathDomain(Domain):
         return ""
 
 
+class AimeDomain(Domain):
+    name = "aime"
+
+    def load_split(self):
+        return load_aime_split()
+
+    def problem_text(self, row: dict) -> str:
+        return str(row.get("problem", ""))
+
+    def evaluate(self, solution: str, row: dict, split: str = "train") -> dict:
+        # Integer answers in row["answer"] stringify cleanly for boxed matching.
+        return evaluate_solution_math(solution, row, split=split)
+
+    def directive(self) -> str:
+        return _MATH_DIRECTIVE
+
+    def reference_answer(self, row: dict) -> str:
+        return str(row.get("answer", ""))
+
+    def difficulty(self, row: dict) -> Any:
+        return "AIME2026"
+
+    def problem_id(self, row: dict) -> Any:
+        return f"aime2026_{row.get('problem_idx', '?')}"
+
+    def privileged_context(self, row: dict) -> str:
+        return ""
+
+
 _DOMAINS: dict[str, Domain] = {
     "code": CodeDomain(),
     "math": MathDomain(),
+    "aime": AimeDomain(),
 }
 
 

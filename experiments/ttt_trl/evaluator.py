@@ -127,6 +127,15 @@ def load_math_split():
     return load_dataset("HuggingFaceH4/MATH-500", split="test")
 
 
+def load_aime_split():
+    """
+    Load the AIME 2026 split.
+
+    Fields per row: problem_idx (int), problem (str), answer (int64).
+    """
+    return load_dataset("MathArena/aime_2026", split="train")
+
+
 def _normalize_math_answer(s: str) -> str:
     """
     Strip LaTeX-cosmetic noise so two expressions that differ only in presentation
@@ -141,11 +150,15 @@ def _normalize_math_answer(s: str) -> str:
     s = str(s).strip()
     # Drop surrounding math delimiters.
     s = s.replace("$", "")
+    # UNWRAP text wrappers to their content: \text{Evelyn} -> Evelyn (the COMMAND
+    # and ITS braces are cosmetic). Only these wrappers' braces are removed -- never
+    # blanket-strip { } (that would collapse \frac{12}{3} and \frac{1}{23}).
+    s = re.sub(r"\\(?:text|mathrm|mbox|textbf|textit)\{([^{}]*)\}", r"\1", s)
     # Sizing wrappers: \left( \right) \bigl \bigr ...
     s = re.sub(r"\\(left|right|bigl|bigr|Bigl|Bigr|biggl|biggr|Biggl|Biggr|big|Big|bigg|Bigg)\b", "", s)
     # frac aliases -> \frac (value-identical).
     s = re.sub(r"\\[dt]frac\b", r"\\frac", s)
-    # Display / text directives that carry no value.
+    # Display / text directives that carry no value (bare, no braces).
     s = re.sub(r"\\(displaystyle|textstyle|scriptstyle|mathrm|text|mbox)\b", "", s)
     # LaTeX spacing commands.
     s = re.sub(r"\\[,;:! ]", "", s)
