@@ -115,6 +115,57 @@ def _apply_reprompt_preset(preset: str, feedback_raw: str) -> tuple[str, str]:
     return formatted_fb, trailing
 
 
+_THINKING_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# Gemma-4 decoded thought/answer boundary (special tokens may appear literally after decode).
+_GEMMA_CHANNEL_DELIM_RE = re.compile(r"<\|?channel\|?>", re.IGNORECASE)
+_GEMMA_THOUGHT_HEADER_RE = re.compile(r"^<\|?channel\|?>?\s*thought\s*", re.IGNORECASE | re.DOTALL)
+
+_EXEMPLAR_MAX_CHARS = 1500
+_EXEMPLAR_BOXED_CONTEXT = 400
+_EXEMPLAR_TAIL_CHARS = 800
+
+
+def _looks_like_code_exemplar(text: str) -> bool:
+    """Long code solutions must not be tail-capped (regression guard)."""
+    t = text.strip()
+    if "```" in t:
+        return True
+    return bool(re.search(r"^\s*(def |class |import |#include)", t, re.MULTILINE))
+
+
+def _tail_cap_exemplar(text: str) -> str:
+    """Keep final answer region: context around last \\boxed{}, else last N chars."""
+    boxed_idx = text.rfind(r"\boxed{")
+    if boxed_idx >= 0:
+        return text[max(0, boxed_idx - _EXEMPLAR_BOXED_CONTEXT) :].strip()
+    return text[-_EXEMPLAR_TAIL_CHARS :].strip()
+
+
+def _strip_thinking_from_exemplar(text: str) -> str:
+    """
+    Drop reasoning from few-shot trajectories; keep post-think solution only.
+    Qwen: <think> blocks. Gemma-4: channel delimiter / thought header.
+    Fallback: tail-cap long math-style text (not code exemplars).
+    """
+    if not text.strip():
+        return ""
+
+    out = _THINKING_BLOCK_RE.sub("", text)
+
+    # Gemma-4: answer follows the last <channel|> (or <|channel|>) delimiter.
+    if _GEMMA_CHANNEL_DELIM_RE.search(out):
+        out = _GEMMA_CHANNEL_DELIM_RE.split(out)[-1]
+    else:
+        out = _GEMMA_THOUGHT_HEADER_RE.sub("", out, count=1)
+
+    out = out.strip()
+
+    if len(out) > _EXEMPLAR_MAX_CHARS and not _looks_like_code_exemplar(out):
+        out = _tail_cap_exemplar(out)
+
+    return out.strip()
+
+
 def _build_fewshot_block(
     good_pool: list[dict],
     bad_pool: list[dict],
@@ -127,14 +178,16 @@ def _build_fewshot_block(
     if goods:
         blocks.append("Here are correct, independent example solutions:")
         for i, ex in enumerate(goods):
-            blocks.append(f"Correct example {i + 1}:\n```python\n{ex['code']}\n```")
+            body = _strip_thinking_from_exemplar(ex["code"])
+            blocks.append(f"Correct example {i + 1}:\n```python\n{body}\n```")
 
     if option == "good_bad":
         bads = bad_pool[:max_fewshot]
         if bads:
             blocks.append("Here are INCORRECT or copied attempts to avoid:")
             for i, ex in enumerate(bads):
-                blocks.append(f"Bad example {i + 1} (do not imitate):\n```python\n{ex['code']}\n```")
+                body = _strip_thinking_from_exemplar(ex["code"])
+                blocks.append(f"Bad example {i + 1} (do not imitate):\n```python\n{body}\n```")
 
     return "\n\n".join(blocks)
 
