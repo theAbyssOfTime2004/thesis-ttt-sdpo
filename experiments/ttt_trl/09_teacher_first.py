@@ -46,7 +46,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 from datasets import Dataset  # noqa: F401  (kept for parity / potential dataset use)
-from peft import get_peft_model
 from transformers import AutoModelForCausalLM, set_seed
 from trl.experimental.sdpo.loss_utils import compute_topk_self_distillation_loss
 
@@ -63,6 +62,7 @@ build_privileged_context = _m07.build_privileged_context
 build_dynamic_feedback = _m07.build_dynamic_feedback
 safe_evaluate_model = _m07.safe_evaluate_model
 _build_lora_config = _m07._build_lora_config
+_apply_lora = _m07._apply_lora
 _extract_text = _m07._extract_text
 REPROMPT_TEMPLATES = _m07.REPROMPT_TEMPLATES
 
@@ -1001,7 +1001,6 @@ def main() -> None:
     print(f"[row] keys = {list(row.keys())}")
 
     tokenizer = _prepare_tokenizer(args.model_name, thinking=args.thinking)
-    lora_config = _build_lora_config(args.lora_r)
 
     total_start = time.time()
     torch.cuda.empty_cache()
@@ -1012,7 +1011,7 @@ def main() -> None:
         torch_dtype=torch.bfloat16,
         device_map="cuda",
     )
-    model = get_peft_model(model, lora_config)
+    model = _apply_lora(model, args.lora_r, model_name=args.model_name)
     model.print_trainable_parameters()
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()

@@ -28,6 +28,7 @@ from typing import Any
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import torch.nn as nn
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
@@ -302,14 +303,76 @@ def safe_evaluate_model(
         }
 
 
-def _build_lora_config(lora_r: int) -> LoraConfig:
+_LORA_LEAF_NAMES = frozenset(
+    {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+)
+
+
+def _gemma4_explicit_lora_targets(model) -> list[str]:
+    """
+    Option B: target inner nn.Linear at `.linear` inside Gemma4ClippableLinear wrappers.
+    """
+    targets: list[str] = []
+    for name, mod in model.named_modules():
+        leaf = name.split(".")[-1]
+        if leaf not in _LORA_LEAF_NAMES:
+            continue
+        if isinstance(mod, nn.Linear):
+            targets.append(name)
+        elif type(mod).__name__ == "Gemma4ClippableLinear":
+            targets.append(f"{name}.linear")
+    if not targets:
+        raise RuntimeError("Gemma-4 explicit LoRA scan found no target modules")
+    return targets
+
+
+def _lora_target_modules(
+    model_name: str,
+    model=None,
+    *,
+    force_explicit: bool = False,
+) -> list[str] | str:
+    if not _is_gemma4_model(model_name):
+        return list(_LORA_LEAF_NAMES)
+    if force_explicit:
+        if model is None:
+            raise ValueError("Gemma-4 explicit LoRA targets require `model`")
+        return _gemma4_explicit_lora_targets(model)
+    # Option A: PEFT picks nn.Linear instances; skips Gemma4ClippableLinear wrappers.
+    return "all-linear"
+
+
+def _build_lora_config(
+    lora_r: int,
+    model_name: str = "",
+    model=None,
+    *,
+    force_explicit: bool = False,
+) -> LoraConfig:
+    target_modules = _lora_target_modules(model_name, model, force_explicit=force_explicit)
+    if _is_gemma4_model(model_name):
+        print(f"[lora] Gemma-4 target_modules={target_modules!r}")
     return LoraConfig(
         r=lora_r,
         lora_alpha=2 * lora_r,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=target_modules,
         lora_dropout=0.05,
         task_type="CAUSAL_LM",
     )
+
+
+def _apply_lora(model, lora_r: int, model_name: str = ""):
+    """Wrap model with LoRA; Gemma-4 falls back to explicit .linear targets if needed."""
+    from peft import get_peft_model
+
+    try:
+        return get_peft_model(model, _build_lora_config(lora_r, model_name=model_name))
+    except Exception as exc:
+        if not _is_gemma4_model(model_name):
+            raise
+        print(f"[lora] all-linear failed ({exc}); explicit Gemma-4 .linear targets")
+        cfg = _build_lora_config(lora_r, model_name=model_name, model=model, force_explicit=True)
+        return get_peft_model(model, cfg)
 
 
 # --- RQ1: reprompt-template taxonomy (syn_template_taxonomy_rationale) ---------
@@ -532,7 +595,6 @@ def main() -> None:
 
     tokenizer = _prepare_tokenizer(args.model_name, thinking=args.thinking)
     print(f"Thinking mode: {args.thinking}")
-    lora_config = _build_lora_config(args.lora_r)
 
     total_start = time.time()
     torch.cuda.empty_cache()
@@ -544,6 +606,8 @@ def main() -> None:
         torch_dtype=torch.bfloat16,
         device_map="cuda",
     )
+
+    lora_config = _build_lora_config(args.lora_r, model_name=args.model_name)
 
     rendered = tokenizer.apply_chat_template(
         _build_messages(question_content, domain, args.model_name, args.thinking),
@@ -635,7 +699,18 @@ def main() -> None:
         "processing_class": tokenizer,
         "peft_config": lora_config,
     }
-    trainer = SDPOTrainer(**_filter_supported_kwargs(SDPOTrainer, trainer_kwargs))
+    try:
+        trainer = SDPOTrainer(**_filter_supported_kwargs(SDPOTrainer, trainer_kwargs))
+    except Exception as exc:
+        if _is_gemma4_model(args.model_name):
+            print(f"[lora] SDPOTrainer init failed ({exc}); explicit Gemma-4 .linear targets")
+            lora_config = _build_lora_config(
+                args.lora_r, model_name=args.model_name, model=model, force_explicit=True
+            )
+            trainer_kwargs["peft_config"] = lora_config
+            trainer = SDPOTrainer(**_filter_supported_kwargs(SDPOTrainer, trainer_kwargs))
+        else:
+            raise
 
     # DIAGNOSTIC: dump the exact prompt the trainer will feed to generation.
     try:
