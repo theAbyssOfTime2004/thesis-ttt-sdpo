@@ -143,9 +143,12 @@ def build_dynamic_feedback(
     This is the verl rich-feedback path (same one baseline multiturn.py consumed).
 
     For math (leak regime) the feedback reveals the correct answer when wrong.
+    Math/aime skip dynamic feedback — privileged_context is the single leak source.
     """
     if domain is None:
         domain = get_domain("code")
+    if domain.name in {"math", "aime"}:
+        return ""
     if not solution_code.strip():
         return ""
     try:

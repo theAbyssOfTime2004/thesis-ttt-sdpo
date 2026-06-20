@@ -154,8 +154,8 @@ class MathDomain(Domain):
         return row.get("unique_id")
 
     def privileged_context(self, row: dict) -> str:
-        # Empty: the leak comes through the correctness feedback, not a hint.
-        return ""
+        # Leak regime: teacher always sees the reference answer (LLM judge catches copy).
+        return f"Reference: the correct final answer is {row.get('answer', '')}."
 
 
 class AimeDomain(Domain):
@@ -184,7 +184,7 @@ class AimeDomain(Domain):
         return f"aime2026_{row.get('problem_idx', '?')}"
 
     def privileged_context(self, row: dict) -> str:
-        return ""
+        return f"Reference: the correct final answer is {row.get('answer', '')}."
 
 
 _DOMAINS: dict[str, Domain] = {
