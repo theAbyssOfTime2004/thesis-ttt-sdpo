@@ -498,13 +498,15 @@ def _call_openai_compat(provider: str, model: str, prompt: str) -> str:
         headers["X-Title"] = "ttt-sdpo-judge"
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:200] if hasattr(exc, "read") else ""
         raise _ProviderError(exc.code, f"{provider} HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise _ProviderError(None, f"{provider} network error: {exc}") from exc
+    # TimeoutError (socket read timeout) is NOT a URLError -> must catch explicitly,
+    # else it escapes _ProviderError handling and crashes the whole run.
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise _ProviderError(None, f"{provider} network/timeout error: {exc}") from exc
     try:
         return payload["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError) as exc:
@@ -571,7 +573,9 @@ def llm_judge(
     prompt = template.format(
         problem=problem_text[:8000],  # cap problem text to keep tokens bounded
         reference=reference_code,
-        candidate=candidate_code,
+        # AIME thinking traces hit ~24k chars -> judge slow/timeouts. Keep the tail,
+        # which holds the final derivation + \boxed answer (enough for derive-vs-copy).
+        candidate=candidate_code[-10000:],
     )
     chain = _build_provider_chain(provider, model, fallback_providers, provider_models)
 
