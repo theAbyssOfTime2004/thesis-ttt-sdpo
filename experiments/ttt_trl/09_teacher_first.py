@@ -671,8 +671,9 @@ def get_reference_text(
     if mode == "ground_truth":
         for key in ("ground_truth", "solution", "reference_solution", "canonical_solution", "answer"):
             val = row.get(key)
-            if isinstance(val, str) and val.strip():
-                return val, None
+            # AIME answers are stored as ints (e.g. 161) -> cast, don't require str.
+            if val is not None and str(val).strip():
+                return str(val), None
         return "", None
     # best_in_batch
     if not batch_trajectories:
