@@ -469,6 +469,11 @@ def main() -> None:
     epoch_stats: list[dict] = []
     all_reward_samples: list[float] = []
     n_grad_steps = 0
+    # Where the wall-clock actually goes. Generation (GPU, autoregressive) and
+    # verification (CPU, runs the generated program against test cases and can sit
+    # on timeouts for non-terminating code) are very different costs, and which one
+    # dominates decides whether a bigger model is affordable.
+    timing = {"greedy_eval": 0.0, "teacher_generate": 0.0, "filter_judge": 0.0, "grad_step": 0.0}
     run_start = time.time()
 
     for epoch in range(args.epochs):
@@ -495,12 +500,14 @@ def main() -> None:
 
             # Student's current greedy attempt: gives dynamic feedback AND decides
             # the dont_reprompt_on_self_success skip.
+            _t = time.time()
             greedy_eval = safe_evaluate_model(
                 model, tokenizer, row, 0, args.max_new_tokens,
                 label=f"E{epoch}P{p_idx}", domain=domain,
                 model_name=args.model_name, thinking=args.thinking,
                 top_p=args.top_p, top_k=args.top_k,
             )
+            timing["greedy_eval"] += time.time() - _t
             greedy_score = greedy_eval.get("greedy_score", 0.0)
 
             if args.dont_reprompt_on_self_success and greedy_score >= 1.0:
@@ -524,6 +531,7 @@ def main() -> None:
             stats: dict = {}
             n_good_here = 0
             for _ in range(args.steps_per_problem):
+                _t = time.time()
                 trajectories, _teacher_prompt = teacher_generate(
                     model, tokenizer, question_content, feedback_text,
                     good_pool, bad_pool, args.fewshot_option, args.teacher_n,
@@ -532,6 +540,8 @@ def main() -> None:
                     domain=domain, model_name=args.model_name, thinking=args.thinking,
                     top_p=args.top_p, top_k=args.top_k,
                 )
+                timing["teacher_generate"] += time.time() - _t
+                _t = time.time()
                 good, bad, stats = filter_trajectories(
                     trajectories, row, args.sim_threshold, args.reference_mode,
                     judge=args.judge, judge_model=judge_primary_model, judge_cache=judge_cache,
@@ -541,6 +551,7 @@ def main() -> None:
                     judge_provider_models=judge_provider_models,
                     domain=domain,
                 )
+                timing["filter_judge"] += time.time() - _t
                 all_reward_samples.extend(stats.get("scores", []))
                 ep["judge_fallbacks"] += stats.get("judge_fallbacks", 0)
                 good_pool = _update_pool(good_pool, good, args.pool_cap)
@@ -559,6 +570,7 @@ def main() -> None:
                     args.model_name, args.thinking,
                 )
                 model.train()
+                _t = time.time()
                 y_good = [g["code"] for g in good]
                 if args.teacher_reg == "none" or args.teacher_reg_alpha >= 1.0:
                     # Delegate to 09 verbatim -> bit-for-bit parity with the thesis runs.
@@ -572,6 +584,7 @@ def main() -> None:
                         y_good, optimizer, args.kl_topk, args.kl_alpha,
                         args.teacher_reg_alpha, verbose=verbose,
                     )
+                timing["grad_step"] += time.time() - _t
                 n_good_here += len(good)
                 n_grad_steps += 1
 
@@ -651,6 +664,16 @@ def main() -> None:
         print(f"pass_rate : {pre_ood['pass_rate']:.3f} -> {post_ood['pass_rate']:.3f} "
               f"(delta {post_ood['pass_rate'] - pre_ood['pass_rate']:+.3f})")
 
+    print("\n=== WHERE THE TIME WENT (training loop only) ===")
+    tracked = sum(timing.values())
+    for k, v in sorted(timing.items(), key=lambda kv: -kv[1]):
+        share = 100 * v / run_elapsed if run_elapsed else 0.0
+        print(f"  {k:<18} {v:8.0f}s  ({share:4.1f}% of training wall-clock)")
+    print(f"  {'untracked':<18} {run_elapsed - tracked:8.0f}s  "
+          f"({100 * (run_elapsed - tracked) / run_elapsed if run_elapsed else 0:4.1f}%)")
+    print("  note: teacher_generate is GPU-bound (autoregressive decode); filter_judge "
+          "is mostly CPU (running generated programs against test cases, incl. timeouts).")
+
     peak_vram = torch.cuda.max_memory_allocated(0)
     total_elapsed = time.time() - total_start
     print(f"\nPeak VRAM: {peak_vram / 1024**3:.2f} GB | train {run_elapsed:.0f}s "
@@ -710,6 +733,7 @@ def main() -> None:
             "pre_ood": pre_ood,
             "post_ood": post_ood,
             "improved": improved,
+            "timing_breakdown_s": timing,
             "train_runtime_s": run_elapsed,
             "total_runtime_s": total_elapsed,
             "peak_vram_gb": peak_vram / 1024**3,
