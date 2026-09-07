@@ -34,6 +34,7 @@ adv_estimator=grpo only disables the critic at the pipeline level).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import importlib
 import json
@@ -75,6 +76,62 @@ from experiments.ttt_trl.evaluator import load_aime_split
 
 
 # --------------------------------------------------------------------------- #
+# Generation speed. Measured 2026-09-04: generation is ~93% of training
+# wall-clock (teacher_generate 73% + greedy eval 20%; verification only 7%), and
+# one batched teacher_generate call took 107s against a ~8s memory-bandwidth
+# floor -- i.e. ~13x off, all of it HF `generate` overhead, not physics.
+# Both helpers below are applied from THIS script only; 07/09 are left untouched
+# so the thesis runs stay reproducible.
+# --------------------------------------------------------------------------- #
+def install_stop_at_code_fence(model, tokenizer, domain: Domain) -> bool:
+    """
+    Make generation stop at the closing ``` fence instead of always running to
+    max_new_tokens. Correct code solutions in the logs are 74-539 chars (~30-150
+    tokens) while the budget is 1024-2048, so nearly all decode time is spent on
+    text that the ```python extractor discards anyway -- stopping early cannot
+    change which code is extracted, only how long we wait for it.
+
+    Implemented by wrapping the bound `model.generate`, because the actual
+    generate calls live inside 07/09 and we do not want to edit those.
+    CODE ONLY: math/aime need the full reasoning chain before \\boxed{}, so
+    there is no safe early stop there.
+    """
+    if domain.name != "code":
+        return False
+    original_generate = model.generate
+
+    def generate_with_stop(*args, **kwargs):
+        kwargs.setdefault("stop_strings", ["\n```"])
+        kwargs.setdefault("tokenizer", tokenizer)  # StopStringCriteria needs it
+        return original_generate(*args, **kwargs)
+
+    model.generate = generate_with_stop
+    return True
+
+
+@contextlib.contextmanager
+def merged_for_generation(model, enabled: bool):
+    """
+    Temporarily fold the LoRA adapter into the base weights so decode does not
+    pay for an extra unfused pair of matmuls in every linear layer.
+
+    OFF BY DEFAULT, and it should stay off unless measured to be worth it:
+    merge/unmerge is `W += BA` then `W -= BA` in place, which in bf16 does NOT
+    round-trip exactly. Over a long run (4 generation calls per problem) the
+    drift accumulates in the weights being trained. Only enable for
+    generation-only benchmarking, or if a run shows the speedup is large enough
+    to justify checking for drift.
+    """
+    if enabled:
+        model.merge_adapter()
+    try:
+        yield
+    finally:
+        if enabled:
+            model.unmerge_adapter()
+
+
+# --------------------------------------------------------------------------- #
 # Dataset split.
 # --------------------------------------------------------------------------- #
 def split_rows(rows, seed: int, n_train: int, n_holdout: int) -> tuple[list[dict], list[dict]]:
@@ -108,12 +165,16 @@ def evaluate_set(model, tokenizer, rows: list[dict], domain: Domain, args, label
     set_seed(args.seed)
     per_row = []
     t0 = time.time()
+    # One merge for the whole eval pass rather than one per problem: same speedup,
+    # far fewer bf16 merge/unmerge round-trips.
+    merge = bool(getattr(args, "merge_lora_for_generation", 0))
     for i, row in enumerate(rows):
-        ev = safe_evaluate_model(
-            model, tokenizer, row, args.eval_samples, args.max_new_tokens,
-            label=f"{label}-{i}", domain=domain, model_name=args.model_name,
-            thinking=args.thinking, top_p=args.top_p, top_k=args.top_k,
-        )
+        with merged_for_generation(model, merge):
+            ev = safe_evaluate_model(
+                model, tokenizer, row, args.eval_samples, args.max_new_tokens,
+                label=f"{label}-{i}", domain=domain, model_name=args.model_name,
+                thinking=args.thinking, top_p=args.top_p, top_k=args.top_k,
+            )
         per_row.append({
             "problem_id": str(domain.problem_id(row)),
             "pass_rate": ev["pass_rate"],
@@ -328,6 +389,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=0)
     p.add_argument("--thinking", action="store_true")
+    p.add_argument("--stop_at_code_fence", type=int, default=1,
+                   help="1 = stop generation at the closing ``` fence (code domain only). "
+                        "Cannot change which code is extracted, only how long decode runs. "
+                        "Set 0 to reproduce the pre-2026-09-04 timing behavior.")
+    p.add_argument("--merge_lora_for_generation", type=int, default=0,
+                   help="1 = fold the LoRA adapter into base weights around each generation "
+                        "call. Faster decode, but merge/unmerge does not round-trip exactly "
+                        "in bf16, so drift accumulates in the trained weights. Leave 0 unless "
+                        "benchmarking.")
     # Run plumbing
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save_every_n", type=int, default=25,
@@ -429,6 +499,15 @@ def main() -> None:
         [p for p in model.parameters() if p.requires_grad], lr=args.learning_rate
     )
 
+    if args.stop_at_code_fence:
+        if install_stop_at_code_fence(model, tokenizer, domain):
+            print("[speed] generation stops at the closing ``` fence")
+        else:
+            print(f"[speed] stop-at-fence not applied (domain={domain.name}, code only)")
+    if args.merge_lora_for_generation:
+        print("[speed][WARN] LoRA merged around generation: bf16 merge/unmerge does not "
+              "round-trip exactly, so trained weights will drift over a long run.")
+
     # ---------------- PRE-eval ----------------
     print(f"\n=== PRE-eval on {len(eval_rows)} held-out problems ===")
     pre_eval = evaluate_set(model, tokenizer, eval_rows, domain, args, "PRE")
@@ -501,12 +580,13 @@ def main() -> None:
             # Student's current greedy attempt: gives dynamic feedback AND decides
             # the dont_reprompt_on_self_success skip.
             _t = time.time()
-            greedy_eval = safe_evaluate_model(
-                model, tokenizer, row, 0, args.max_new_tokens,
-                label=f"E{epoch}P{p_idx}", domain=domain,
-                model_name=args.model_name, thinking=args.thinking,
-                top_p=args.top_p, top_k=args.top_k,
-            )
+            with merged_for_generation(model, bool(args.merge_lora_for_generation)):
+                greedy_eval = safe_evaluate_model(
+                    model, tokenizer, row, 0, args.max_new_tokens,
+                    label=f"E{epoch}P{p_idx}", domain=domain,
+                    model_name=args.model_name, thinking=args.thinking,
+                    top_p=args.top_p, top_k=args.top_k,
+                )
             timing["greedy_eval"] += time.time() - _t
             greedy_score = greedy_eval.get("greedy_score", 0.0)
 
@@ -532,14 +612,15 @@ def main() -> None:
             n_good_here = 0
             for _ in range(args.steps_per_problem):
                 _t = time.time()
-                trajectories, _teacher_prompt = teacher_generate(
-                    model, tokenizer, question_content, feedback_text,
-                    good_pool, bad_pool, args.fewshot_option, args.teacher_n,
-                    args.teacher_temperature, args.max_new_tokens, args.max_fewshot,
-                    args.reprompt_template, args.max_prompt_length, verbose=verbose,
-                    domain=domain, model_name=args.model_name, thinking=args.thinking,
-                    top_p=args.top_p, top_k=args.top_k,
-                )
+                with merged_for_generation(model, bool(args.merge_lora_for_generation)):
+                    trajectories, _teacher_prompt = teacher_generate(
+                        model, tokenizer, question_content, feedback_text,
+                        good_pool, bad_pool, args.fewshot_option, args.teacher_n,
+                        args.teacher_temperature, args.max_new_tokens, args.max_fewshot,
+                        args.reprompt_template, args.max_prompt_length, verbose=verbose,
+                        domain=domain, model_name=args.model_name, thinking=args.thinking,
+                        top_p=args.top_p, top_k=args.top_k,
+                    )
                 timing["teacher_generate"] += time.time() - _t
                 _t = time.time()
                 good, bad, stats = filter_trajectories(
