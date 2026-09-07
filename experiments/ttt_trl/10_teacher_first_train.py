@@ -47,7 +47,12 @@ import time
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
-from transformers import AutoModelForCausalLM, set_seed
+from transformers import (
+    AutoModelForCausalLM,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    set_seed,
+)
 from trl.experimental.sdpo.loss_utils import compute_topk_self_distillation_loss
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
@@ -83,6 +88,41 @@ from experiments.ttt_trl.evaluator import load_aime_split
 # Both helpers below are applied from THIS script only; 07/09 are left untouched
 # so the thesis runs stay reproducible.
 # --------------------------------------------------------------------------- #
+class ClosingFenceCriteria(StoppingCriteria):
+    """
+    Stop a sequence once its SECOND ``` fence has been emitted, i.e. the code
+    block has been closed.
+
+    Do NOT do this with `stop_strings=["\\n```"]`: the rendered prompt ends in
+    newlines, so the very first ``` the model emits already makes the sequence
+    end with "\\n```" and generation stops after 3 characters. That regression
+    was observed on 2026-09-04 (every completion became a bare fence, every
+    score went to 0.00, and the run got 60x "faster" by generating nothing).
+
+    Counting is incremental: only the newest token is decoded each step and
+    appended to a short tail buffer, so this is O(1) per sequence per step
+    rather than re-decoding the whole growing sequence.
+    """
+
+    def __init__(self, tokenizer, n_sequences: int, fence: str = "```"):
+        self.tokenizer = tokenizer
+        self.fence = fence
+        self.counts = [0] * n_sequences
+        self.tails = [""] * n_sequences
+
+    def __call__(self, input_ids, scores, **kwargs):
+        done = []
+        for i in range(input_ids.shape[0]):
+            idx = i if i < len(self.counts) else len(self.counts) - 1
+            piece = self.tokenizer.decode(input_ids[i, -1:], skip_special_tokens=True)
+            self.tails[idx] = (self.tails[idx] + piece)[-8:]
+            if self.fence in self.tails[idx]:
+                self.counts[idx] += 1
+                self.tails[idx] = ""  # consume, so one fence is counted once
+            done.append(self.counts[idx] >= 2)
+        return torch.tensor(done, device=input_ids.device)
+
+
 def install_stop_at_code_fence(model, tokenizer, domain: Domain) -> bool:
     """
     Make generation stop at the closing ``` fence instead of always running to
@@ -101,8 +141,16 @@ def install_stop_at_code_fence(model, tokenizer, domain: Domain) -> bool:
     original_generate = model.generate
 
     def generate_with_stop(*args, **kwargs):
-        kwargs.setdefault("stop_strings", ["\n```"])
-        kwargs.setdefault("tokenizer", tokenizer)  # StopStringCriteria needs it
+        if "stopping_criteria" not in kwargs:
+            ids = kwargs.get("input_ids")
+            if ids is None and args:
+                ids = args[0]
+            n_seq = kwargs.get("num_return_sequences", 1) or 1
+            if ids is not None:
+                n_seq *= ids.shape[0]
+            kwargs["stopping_criteria"] = StoppingCriteriaList(
+                [ClosingFenceCriteria(tokenizer, n_seq)]
+            )
         return original_generate(*args, **kwargs)
 
     model.generate = generate_with_stop
