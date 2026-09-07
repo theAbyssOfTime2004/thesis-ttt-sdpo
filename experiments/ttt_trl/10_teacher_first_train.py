@@ -270,6 +270,9 @@ def parse_args() -> argparse.Namespace:
                         "(full holdout x eval_samples gets expensive fast). 0 = all.")
     p.add_argument("--eval_ood", action="store_true",
                    help="math only: also evaluate AIME-2026 as an OOD set.")
+    p.add_argument("--frontier_scan_samples", type=int, default=4,
+                   help="Samples per problem used by --filter_frontier to measure pass_rate. "
+                        "Must be >0: frontier means the model solves it SOMETIMES.")
     p.add_argument("--filter_frontier", action="store_true",
                    help="Restrict the TRAIN split to problems with greedy score in (0,1). "
                         "OFF by default on purpose -- see spec 3.")
@@ -433,15 +436,27 @@ def main() -> None:
 
     # ---------------- optional frontier filter on TRAIN ----------------
     if args.filter_frontier:
-        print("\n[filter_frontier] screening train split (greedy score strictly in (0,1)) ...")
+        # Frontier must be measured as PASS RATE over samples (the model solves the
+        # problem SOMETIMES), not as the dense greedy score. A greedy score of 0.42
+        # only means partial test-case credit and is compatible with pass@k == 0,
+        # i.e. the model never actually solves it -- and since filter_trajectories
+        # requires score >= 1.0, such problems can never yield a distillation
+        # target. Screening on greedy score (the 2026-09-04 bug) selected exactly
+        # the problems least able to produce a gradient: 0/3 fired.
+        print(f"\n[filter_frontier] screening train split on pass_rate over "
+              f"{args.frontier_scan_samples} samples (strictly in (0,1)) ...")
         kept = []
         for row in train_rows:
             ev = safe_evaluate_model(
-                model, tokenizer, row, 0, args.max_new_tokens, label="SCAN",
-                domain=domain, model_name=args.model_name, thinking=args.thinking,
-                top_p=args.top_p, top_k=args.top_k,
+                model, tokenizer, row, args.frontier_scan_samples, args.max_new_tokens,
+                label="SCAN", domain=domain, model_name=args.model_name,
+                thinking=args.thinking, top_p=args.top_p, top_k=args.top_k,
             )
-            if 0.0 < ev["greedy_score"] < 1.0:
+            pid = str(domain.problem_id(row))
+            keep = 0.0 < ev["pass_rate"] < 1.0
+            print(f"  [scan] {pid}: pass_rate={ev['pass_rate']:.2f} "
+                  f"greedy={ev['greedy_score']:.2f} -> {'keep' if keep else 'drop'}")
+            if keep:
                 kept.append(row)
         print(f"[filter_frontier] kept {len(kept)}/{len(train_rows)}")
         train_rows = kept
@@ -532,7 +547,11 @@ def main() -> None:
                 bad_pool = _update_pool(bad_pool, bad, args.pool_cap)
 
                 if not good:
-                    break
+                    # Retry with fresh teacher samples rather than abandoning the
+                    # problem: teacher generation is stochastic, so another attempt
+                    # can succeed where this one did not. (Was `break`, which made
+                    # --steps_per_problem a no-op.)
+                    continue
 
                 teacher_messages = _build_teacher_messages(
                     question_content, feedback_text, good_pool, bad_pool,
