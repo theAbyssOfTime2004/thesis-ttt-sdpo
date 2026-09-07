@@ -100,6 +100,12 @@ def split_rows(rows, seed: int, n_train: int, n_holdout: int) -> tuple[list[dict
 # --------------------------------------------------------------------------- #
 def evaluate_set(model, tokenizer, rows: list[dict], domain: Domain, args, label: str) -> dict:
     """Run safe_evaluate_model per row and aggregate. Keeps per-row detail."""
+    # Seed identically for every eval pass. With unchanged weights this makes PRE
+    # and POST bit-identical, so a nonzero delta is attributable to training rather
+    # than sampling noise (spec 7). The 2026-09-04 smoke test reported IMPROVED on a
+    # run with ZERO gradient steps because this was missing -- if that ever recurs,
+    # it is a regression, not a result.
+    set_seed(args.seed)
     per_row = []
     t0 = time.time()
     for i, row in enumerate(rows):
@@ -631,11 +637,19 @@ def main() -> None:
     print(f"\nPeak VRAM: {peak_vram / 1024**3:.2f} GB | train {run_elapsed:.0f}s "
           f"| total {total_elapsed:.0f}s")
 
-    improved = (
-        post_eval["pass_rate"] > pre_eval["pass_rate"]
-        or post_eval["mean_score"] > pre_eval["mean_score"]
-    )
-    print(f"VERDICT: {'IMPROVED' if improved else 'NO IMPROVEMENT'} on held-out")
+    delta_pass = post_eval["pass_rate"] - pre_eval["pass_rate"]
+    delta_mean = post_eval["mean_score"] - pre_eval["mean_score"]
+    if n_grad_steps == 0:
+        # Nothing was trained: any delta is eval noise. Report the noise floor
+        # instead of a verdict -- never let this path print IMPROVED.
+        improved = False
+        print(f"VERDICT: NO TRAINING OCCURRED (0 gradient steps). "
+              f"pass delta {delta_pass:+.3f}, mean delta {delta_mean:+.3f} is pure eval "
+              f"noise; with seeded eval these should now be exactly 0.000.")
+    else:
+        improved = delta_pass > 0 or delta_mean > 0
+        print(f"VERDICT: {'IMPROVED' if improved else 'NO IMPROVEMENT'} on held-out "
+              f"({n_grad_steps} gradient steps)")
 
     if use_wandb:
         wandb.summary.update({
