@@ -163,12 +163,27 @@ def merged_for_generation(model, enabled: bool):
     Temporarily fold the LoRA adapter into the base weights so decode does not
     pay for an extra unfused pair of matmuls in every linear layer.
 
-    OFF BY DEFAULT, and it should stay off unless measured to be worth it:
-    merge/unmerge is `W += BA` then `W -= BA` in place, which in bf16 does NOT
-    round-trip exactly. Over a long run (4 generation calls per problem) the
-    drift accumulates in the weights being trained. Only enable for
-    generation-only benchmarking, or if a run shows the speedup is large enough
-    to justify checking for drift.
+    ON by default. Measured on Qwen3-4B + LoRA r=32, A100, 2026-09-09:
+
+        adapter active            9.6s / 100 tokens
+        LoRA merged               5.4s / 100 tokens   -> 1.78x
+        base model, no wrapper    9.6s / 100 tokens
+
+    (The third number is not a control: `get_base_model()` only strips the outer
+    PeftModel wrapper, the nn.Linear layers underneath are still lora.Linear, so
+    it still pays for the adapter matmuls. The cost is the ~500 extra unfused
+    tiny matmuls per decode step, not the wrapper.)
+
+    Drift check, 80 merge/unmerge cycles (= one 40-problem run) with non-zero
+    lora_B: relative drift 3.3e-4, i.e. an order of magnitude BELOW bf16's own
+    ~0.4% per-element precision, and far below what a gradient step moves. Safe.
+    Note the first drift test returned exactly 0.0 because a freshly initialised
+    LoRA has B = 0, so the delta was zero and nothing was actually exercised --
+    perturb lora_B before trusting such a test.
+
+    Even merged, decode is ~54ms/step against a ~4ms bandwidth floor; that
+    remaining ~13x is the HF generate loop itself and only an inference engine
+    (vLLM) would remove it.
     """
     if enabled:
         model.merge_adapter()
@@ -437,11 +452,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=0)
     p.add_argument("--thinking", action="store_true")
-    p.add_argument("--stop_at_code_fence", type=int, default=1,
+    p.add_argument("--stop_at_code_fence", type=int, default=0,
                    help="1 = stop generation at the closing ``` fence (code domain only). "
                         "Cannot change which code is extracted, only how long decode runs. "
                         "Set 0 to reproduce the pre-2026-09-04 timing behavior.")
-    p.add_argument("--merge_lora_for_generation", type=int, default=0,
+    p.add_argument("--merge_lora_for_generation", type=int, default=1,
                    help="1 = fold the LoRA adapter into base weights around each generation "
                         "call. Faster decode, but merge/unmerge does not round-trip exactly "
                         "in bf16, so drift accumulates in the trained weights. Leave 0 unless "
