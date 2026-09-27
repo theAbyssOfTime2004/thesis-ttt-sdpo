@@ -40,6 +40,7 @@ import importlib
 import json
 import os
 import pathlib
+import re
 import statistics
 import sys
 import time
@@ -249,45 +250,134 @@ def student_generate(
     return completions
 
 
-def select_student_targets(
+_PAPER_ACTOR_YAML = (
+    pathlib.Path(__file__).resolve().parents[2] / "verl" / "trainer" / "config" / "actor" / "actor.yaml"
+)
+# Verbatim from verl RayPPOTrainer._remove_thinking_trace.
+_PAPER_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+def load_paper_sdpo_cfg() -> dict:
+    """
+    Read the reprompt templates and flags straight from the paper's own config
+    (verl/trainer/config/actor/actor.yaml, `self_distillation:` block) instead of
+    retyping them, so the student-first baseline uses byte-identical strings.
+    Neither sdpo.yaml nor experiments/rich_feedback/run_sdpo.sh overrides these.
+
+    success_reward_threshold is deliberately NOT taken from here: the config says
+    0.5, but the paper's LCBv6 training calls the code reward with
+    sparse_rewards=True (verl/utils/reward_score/feedback/__init__.py), i.e. a
+    binary 0/1 reward, where 0.5 just means "passed every test". Our evaluator
+    returns the dense pass ratio, so the equivalent test is score >= 1.0. Applying
+    0.5 to a dense score would instead accept code that passes half the tests.
+    """
+    import yaml
+
+    with open(_PAPER_ACTOR_YAML, encoding="utf-8") as f:
+        sd = yaml.safe_load(f)["self_distillation"]
+    keys = [
+        "reprompt_template",
+        "solution_template",
+        "feedback_template",
+        "environment_feedback_only_without_solution",
+        "dont_reprompt_on_self_success",
+        "remove_thinking_from_demonstration",
+        "max_reprompt_len",
+    ]
+    missing = [k for k in keys if k not in sd]
+    if missing:
+        raise KeyError(f"paper config {_PAPER_ACTOR_YAML} is missing {missing}")
+    return {k: sd[k] for k in keys}
+
+
+def build_student_first_pairs(
     rollouts: list[str],
     row: dict,
     domain: Domain,
+    student_messages: list[dict[str, str]],
+    cfg: dict,
     dont_reprompt_on_self_success: bool,
-) -> tuple[list[str], str, list[float]]:
+) -> tuple[list[tuple[list[dict[str, str]], str]], dict]:
     """
-    Pick which of the student's own rollouts get distilled, following the paper.
+    The paper's SDPO teacher construction, mirrored from
+    RayPPOTrainer._maybe_build_self_distillation_batch, applied per rollout.
 
-    Returns (targets, best_successful_rollout, all_scores).
+    For rollout i:
+      * solution = the first OTHER rollout of the same prompt that passed
+        (itself excluded when dont_reprompt_on_self_success), thinking stripped.
+      * feedback = the environment feedback for rollout i ITSELF -- not for some
+        other attempt. This is the "retrospective" part: the teacher looks back
+        at this exact attempt and its own grader output.
+      * with environment_feedback_only_without_solution, feedback is used only
+        when no solution is available.
+      * rollout i is distilled iff it has a solution or uses feedback; otherwise
+        the paper's self_distillation_mask is 0 for it and it is skipped.
 
-    Two things differ from the teacher-first arm and they matter for §2d:
-      * A rollout does NOT have to be correct to be a target. The paper's whole
-        point is learning from FAILED attempts: the teacher sees the feedback and
-        retrospectively fixes them, and the student distils toward that. So this
-        arm produces a gradient on almost every problem, while teacher-first
-        needs the teacher to actually solve it (measured yield ~5%).
-      * `dont_reprompt_on_self_success` drops rollouts that already passed --
-        there is nothing to fix in those.
-    Consequence: the two arms will see very different amounts of data. That is a
-    property of the mechanisms, not a bug, but it must be reported (and the
-    comparison made at equal gradient-step count if the gap is large).
+    Returns (pairs, info) where each pair is (teacher_messages, rollout) and the
+    KL step distils student(prompt + rollout) toward teacher(reprompt + rollout).
+
+    Note on yield (§2d): rollouts do not need to be correct to be distilled, and a
+    correct rollout is still distilled toward a sibling solution, so this arm
+    produces a gradient on nearly every problem. The teacher-first arm needs the
+    teacher to actually solve the problem. That asymmetry is the mechanism, not a
+    bug, and is reported per epoch.
     """
-    scored: list[tuple[str, float]] = []
+    scores: list[float] = []
+    feedbacks: list[str | None] = []
     for code in rollouts:
         try:
-            s = float(domain.evaluate(code, row, split="train")["score"])
+            out = domain.evaluate(code, row, split="train")
+            s = float(out.get("score", 0.0))
+            det = out.get("details")
+            fb = str(det.get("feedback", "") or "") if isinstance(det, dict) else ""
         except Exception as exc:
             print(f"[student-first] score error: {exc}")
-            s = 0.0
-        scored.append((code, s))
+            s, fb = 0.0, ""
+        scores.append(s)
+        # verl keeps only non-empty feedback strings; the code reward returns ""
+        # when every test passes.
+        feedbacks.append(fb if fb.strip() else None)
 
-    successes = [c for c, s in scored if s >= 1.0]
-    best_success = successes[0] if successes else ""
-    if dont_reprompt_on_self_success:
-        targets = [c for c, s in scored if s < 1.0]
-    else:
-        targets = [c for c, _ in scored]
-    return targets, best_success, [s for _, s in scored]
+    # Binary success, equivalent to the paper's sparse reward vs threshold 0.5.
+    success_idx = [i for i, s in enumerate(scores) if s >= 1.0]
+    system_msgs = student_messages[:-1]
+    prompt_text = student_messages[-1]["content"]
+
+    pairs: list[tuple[list[dict[str, str]], str]] = []
+    n_with_solution = 0
+    n_with_feedback = 0
+    for i, y in enumerate(rollouts):
+        cands = [j for j in success_idx if j != i] if dont_reprompt_on_self_success else success_idx
+        solution = rollouts[cands[0]] if cands else None
+        if solution is not None and cfg["remove_thinking_from_demonstration"]:
+            solution = _PAPER_THINK_RE.sub("", solution)
+        has_fb = feedbacks[i] is not None
+        use_fb = has_fb and (
+            not cfg["environment_feedback_only_without_solution"] or solution is None
+        )
+        if solution is None and not use_fb:
+            continue
+        solution_section = (
+            cfg["solution_template"].format(successful_previous_attempt=solution)
+            if solution is not None else ""
+        )
+        feedback_section = cfg["feedback_template"].format(feedback_raw=feedbacks[i]) if use_fb else ""
+        reprompt = cfg["reprompt_template"].format(
+            prompt=prompt_text, solution=solution_section, feedback=feedback_section
+        )
+        pairs.append((system_msgs + [{"role": "user", "content": reprompt}], y))
+        n_with_solution += solution is not None
+        n_with_feedback += use_fb
+
+    info = {
+        "scores": scores,
+        "n_rollouts": len(rollouts),
+        "n_rollouts_passed": len(success_idx),
+        "n_targets": len(pairs),
+        "n_targets_with_solution": n_with_solution,
+        "n_targets_with_feedback": n_with_feedback,
+    }
+    return pairs, info
 
 
 # --------------------------------------------------------------------------- #
@@ -361,56 +451,76 @@ def evaluate_set(model, tokenizer, rows: list[dict], domain: Domain, args, label
 # --------------------------------------------------------------------------- #
 # Trust-region teacher (spec 2b).
 # --------------------------------------------------------------------------- #
-def teacher_first_step_trust_region(
+def distill_step_pairs(
     model,
     tokenizer,
     student_messages: list[dict[str, str]],
-    teacher_messages: list[dict[str, str]],
-    y_good_list: list[str],
+    pairs: list[tuple[list[dict[str, str]], str]],
     optimizer,
     kl_topk: int,
     kl_alpha: float,
     tr_alpha: float,
+    max_reprompt_len: int | None = None,
     verbose: bool = False,
 ) -> float:
     """
-    Same as 09.teacher_first_step, except the teacher distribution is the
-    trust-region interpolation of the INITIAL teacher and the CURRENT teacher:
+    One optimizer step distilling student(prompt + y) toward teacher(ctx + y) over
+    a list of (teacher_messages, y) pairs. Each pair may carry its OWN teacher
+    context -- the student-first arm needs that, since every rollout gets the
+    grader feedback of that rollout. The teacher-first arm passes the same context
+    for every y. Loss per pair is the token-mean top-k KL divided by the number of
+    pairs, and there is exactly one optimizer.step(), as in 09.teacher_first_step.
+
+    Trust-region teacher (paper 2.3):
 
         log q_teacher = (1 - tr_alpha) * log q_theta_ref + tr_alpha * log q_theta
 
-    Both terms run on the TEACHER prefix (feedback + few-shot). q_theta_ref is
-    the same forward with the LoRA adapter disabled -- NOT the initial model on
-    the student prompt, which would be the Chen et al. (2025c) variant the SDPO
-    authors report underperforms (spec 2b.2, paper App. B.2).
+    Both terms run on the TEACHER prefix. q_theta_ref is the same forward with the
+    LoRA adapter disabled -- NOT the initial model on the student prompt, which
+    would be the Chen et al. (2025c) variant the SDPO authors report
+    underperforms (spec 2b.2, paper App. B.2). With tr_alpha >= 1 the reference
+    forward is skipped entirely (teacher = current weights).
 
     lerp on logits == lerp on log-probs after renormalization: the two differ by
     a per-position constant that softmax/top-k renorm cancels.
+
+    max_reprompt_len: if set, the rendered teacher prefix is truncated on the
+    right to this many tokens, as verl does for the reprompt (paper default 10240).
     """
     device = next(model.parameters()).device
 
     student_prefix_text = tokenizer.apply_chat_template(
         student_messages, add_generation_prompt=True, tokenize=False
     )
-    teacher_prefix_text = tokenizer.apply_chat_template(
-        teacher_messages, add_generation_prompt=True, tokenize=False
-    )
     student_prefix_ids = tokenizer(student_prefix_text, return_tensors="pt").input_ids.to(device)
-    teacher_prefix_ids = tokenizer(teacher_prefix_text, return_tensors="pt").input_ids.to(device)
     s_prefix = student_prefix_ids.shape[1]
-    t_prefix = teacher_prefix_ids.shape[1]
-    if verbose:
-        print(f"[kl-tr] student_prefix_len={s_prefix} teacher_prefix_len={t_prefix} "
-              f"tr_alpha={tr_alpha}")
-        print(f"[kl-tr] ref forward uses the TEACHER prefix ({t_prefix} tokens) with the "
-              f"adapter disabled -> q_theta_ref, not pi_theta_ref")
+    teacher_prefix_cache: dict[str, torch.Tensor] = {}
+    use_ref = tr_alpha < 1.0
 
     optimizer.zero_grad()
-    n = len(y_good_list)
+    n = len(pairs)
     loss_sum = 0.0
     contributing = 0
 
-    for y in y_good_list:
+    for teacher_messages, y in pairs:
+        t_text = tokenizer.apply_chat_template(
+            teacher_messages, add_generation_prompt=True, tokenize=False
+        )
+        if t_text not in teacher_prefix_cache:
+            ids = tokenizer(t_text, return_tensors="pt").input_ids.to(device)
+            if max_reprompt_len and ids.shape[1] > max_reprompt_len:
+                ids = ids[:, :max_reprompt_len]
+            teacher_prefix_cache[t_text] = ids
+        teacher_prefix_ids = teacher_prefix_cache[t_text]
+        t_prefix = teacher_prefix_ids.shape[1]
+
+        if verbose and contributing == 0:
+            print(f"[kl] student_prefix_len={s_prefix} teacher_prefix_len={t_prefix} "
+                  f"tr_alpha={tr_alpha} n_pairs={n}")
+            if use_ref:
+                print(f"[kl] ref forward uses the TEACHER prefix ({t_prefix} tokens) with the "
+                      f"adapter disabled -> q_theta_ref, not pi_theta_ref")
+
         comp_ids = tokenizer(y, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         length = comp_ids.shape[1]
         if length == 0:
@@ -420,26 +530,29 @@ def teacher_first_step_trust_region(
         teacher_input = torch.cat([teacher_prefix_ids, comp_ids], dim=1)
         assert torch.equal(
             student_input[:, s_prefix:], teacher_input[:, t_prefix:]
-        ), "y_good tokens differ across student/teacher sides"
+        ), "distilled tokens differ across student/teacher sides"
 
         student_logits = model(input_ids=student_input, use_cache=False).logits
         s_slice = student_logits[:, s_prefix - 1 : s_prefix - 1 + length, :]
 
         with torch.no_grad():
-            # Two teacher forwards. Slice and free each full-sequence logits tensor
-            # BEFORE running the next one: at Qwen3 vocab (~152k) a [1, L, V] bf16
-            # tensor is ~300 MB at L=1024, and holding all of them at once is what
-            # pushes an L4 over the edge.
+            # Slice and free each full-sequence logits tensor BEFORE the next
+            # forward: at Qwen3 vocab (~152k) a [1, L, V] bf16 tensor is ~300 MB at
+            # L=1024, and holding several at once is what pushes an L4 over.
             # q_theta : current weights, teacher context.
             t_cur_full = model(input_ids=teacher_input, use_cache=False).logits
             t_cur = t_cur_full[:, t_prefix - 1 : t_prefix - 1 + length, :].clone()
             del t_cur_full
-            # q_theta_ref : initial weights (adapter off), SAME teacher context.
-            with model.disable_adapter():
-                t_ref_full = model(input_ids=teacher_input, use_cache=False).logits
-                t_ref = t_ref_full[:, t_prefix - 1 : t_prefix - 1 + length, :].clone()
-                del t_ref_full
-            t_slice = torch.lerp(t_ref, t_cur, tr_alpha)
+            if use_ref:
+                # q_theta_ref : initial weights (adapter off), SAME teacher context.
+                with model.disable_adapter():
+                    t_ref_full = model(input_ids=teacher_input, use_cache=False).logits
+                    t_ref = t_ref_full[:, t_prefix - 1 : t_prefix - 1 + length, :].clone()
+                    del t_ref_full
+                t_slice = torch.lerp(t_ref, t_cur, tr_alpha)
+            else:
+                t_ref = None
+                t_slice = t_cur
 
         assert s_slice.shape[1] == length, f"student slice {s_slice.shape[1]} != {length}"
         assert t_slice.shape[1] == length, f"teacher slice {t_slice.shape[1]} != {length}"
@@ -452,12 +565,13 @@ def teacher_first_step_trust_region(
         )
         item_loss = per_token.mean()
 
-        if verbose and contributing == 0:
+        if verbose and contributing == 0 and use_ref:
             d_cur = (t_slice - t_cur).abs().mean().item()
             d_ref = (t_slice - t_ref).abs().mean().item()
             print(f"[kl-tr-sanity] L={length} KL={item_loss.item():.6f} "
                   f"dist_to_cur={d_cur:.4f} dist_to_ref={d_ref:.4f} "
-                  f"(small tr_alpha -> teacher must sit CLOSER to ref)")
+                  f"(small tr_alpha -> teacher must sit CLOSER to ref; both 0 at step 1 "
+                  f"because lora_B starts at 0)")
 
         (item_loss / n).backward()
         loss_sum += item_loss.item()
@@ -511,7 +625,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--steps_per_problem", type=int, default=1)
     p.add_argument("--dont_reprompt_on_self_success", type=int, default=1,
-                   help="1 = skip a problem the student already solves greedily (paper default).")
+                   help="Paper default 1. teacher_first: skip a problem whose greedy draft "
+                        "already passes. student_first: exactly the verl semantics -- a "
+                        "rollout is never its own demonstration (it can still be distilled "
+                        "toward another passing sibling).")
     # Teacher-first mechanism (reused from 09)
     p.add_argument("--teacher_n", type=int, default=10)
     p.add_argument("--teacher_temperature", type=float, default=1.0)
@@ -709,6 +826,13 @@ def main() -> None:
         train_rows = kept
 
     # ---------------- train loop ----------------
+    paper_cfg = None
+    if args.arm == "student_first":
+        paper_cfg = load_paper_sdpo_cfg()
+        print(f"[student-first] templates + flags read from {_PAPER_ACTOR_YAML}: "
+              f"feedback_only_without_solution={paper_cfg['environment_feedback_only_without_solution']} "
+              f"remove_thinking={paper_cfg['remove_thinking_from_demonstration']} "
+              f"max_reprompt_len={paper_cfg['max_reprompt_len']}")
     judge_cache: dict[str, dict] = {}
     good_pool: list[dict] = []
     bad_pool: list[dict] = []
@@ -733,6 +857,10 @@ def main() -> None:
             "n_good_total": 0,
             "judge_fallbacks": 0,
             "loss_sum": 0.0,
+            # student-first only (paper Path A / Path B):
+            "n_rollouts_passed": 0,
+            "n_targets_with_solution": 0,
+            "n_targets_with_feedback": 0,
         }
         print(f"\n=== EPOCH {epoch + 1}/{args.epochs} over {len(train_rows)} problems ===")
 
@@ -745,44 +873,52 @@ def main() -> None:
             if args.pool_mode == "reset":
                 good_pool, bad_pool = [], []
 
-            # Student's current greedy attempt: gives dynamic feedback AND decides
-            # the dont_reprompt_on_self_success skip.
-            _t = time.time()
-            with merged_for_generation(model, bool(args.merge_lora_for_generation)):
-                greedy_eval = safe_evaluate_model(
-                    model, tokenizer, row, 0, args.max_new_tokens,
-                    label=f"E{epoch}P{p_idx}", domain=domain,
-                    model_name=args.model_name, thinking=args.thinking,
-                    top_p=args.top_p, top_k=args.top_k,
-                )
-            timing["greedy_eval"] += time.time() - _t
-            greedy_score = greedy_eval.get("greedy_score", 0.0)
-
-            if args.dont_reprompt_on_self_success and greedy_score >= 1.0:
-                ep["n_skipped_already_solved"] += 1
-                problem_records.append({
-                    "epoch": epoch + 1, "problem_id": problem_id, "outcome": "skip_already_solved",
-                    "greedy_score": greedy_score, "loss": 0.0, "n_good": 0,
-                })
-                print(f"[e{epoch + 1} p{p_idx + 1}/{len(train_rows)}] {problem_id}: "
-                      f"already solved (greedy={greedy_score:.2f}) -> skip")
-                continue
-
-            base_hint = domain.privileged_context(row)
-            dyn = build_dynamic_feedback(greedy_eval.get("greedy_code", ""), row, domain=domain)
-            feedback_text = "\n\n".join(x for x in [base_hint, dyn] if x).strip()
             student_messages = _build_messages(
                 question_content, domain, args.model_name, args.thinking
             )
+            greedy_score = None
+            feedback_text = ""
+
+            if args.arm == "teacher_first":
+                # Teacher-first needs to know what the student gets wrong BEFORE the
+                # teacher writes anything, so it starts with one unaided greedy draft.
+                # Its grader output is the feedback the teacher sees, and a draft that
+                # already passes means there is nothing to teach on this problem.
+                # (The student-first arm has no draft: in the paper the rollouts
+                # themselves are graded afterwards, each with its own feedback.)
+                _t = time.time()
+                with merged_for_generation(model, bool(args.merge_lora_for_generation)):
+                    greedy_eval = safe_evaluate_model(
+                        model, tokenizer, row, 0, args.max_new_tokens,
+                        label=f"E{epoch}P{p_idx}", domain=domain,
+                        model_name=args.model_name, thinking=args.thinking,
+                        top_p=args.top_p, top_k=args.top_k,
+                    )
+                timing["greedy_eval"] += time.time() - _t
+                greedy_score = greedy_eval.get("greedy_score", 0.0)
+
+                if args.dont_reprompt_on_self_success and greedy_score >= 1.0:
+                    ep["n_skipped_already_solved"] += 1
+                    problem_records.append({
+                        "epoch": epoch + 1, "problem_id": problem_id,
+                        "outcome": "skip_already_solved",
+                        "greedy_score": greedy_score, "loss": 0.0, "n_good": 0,
+                    })
+                    print(f"[e{epoch + 1} p{p_idx + 1}/{len(train_rows)}] {problem_id}: "
+                          f"already solved (greedy={greedy_score:.2f}) -> skip")
+                    continue
+
+                base_hint = domain.privileged_context(row)
+                dyn = build_dynamic_feedback(greedy_eval.get("greedy_code", ""), row, domain=domain)
+                feedback_text = "\n\n".join(x for x in [base_hint, dyn] if x).strip()
 
             step_loss = 0.0
             stats: dict = {}
             n_good_here = 0
             for _ in range(args.steps_per_problem):
-                # The two arms differ in exactly one thing: where the trajectories
-                # being distilled come from. Everything after this block -- the
-                # teacher context, the KL step, the accounting -- is shared, so the
-                # comparison isolates the mechanism.
+                # The two arms differ in where the distilled trajectories come from
+                # and in how the teacher context is built for them. The KL step and
+                # the accounting are shared.
                 if args.arm == "teacher_first":
                     _t = time.time()
                     with merged_for_generation(model, bool(args.merge_lora_for_generation)):
@@ -812,13 +948,21 @@ def main() -> None:
                     good_pool = _update_pool(good_pool, good, args.pool_cap)
                     bad_pool = _update_pool(bad_pool, bad, args.pool_cap)
                     y_targets = [g["code"] for g in good]
-                    demo_good, demo_bad = good_pool, bad_pool
                     if not y_targets:
                         # Retry with fresh teacher samples rather than abandoning the
                         # problem: teacher generation is stochastic, so another attempt
                         # can succeed where this one did not. (Was `break`, which made
                         # --steps_per_problem a no-op.)
                         continue
+                    # One shared teacher context (problem + draft feedback + few-shot),
+                    # distilled over each good teacher trajectory.
+                    teacher_messages = _build_teacher_messages(
+                        question_content, feedback_text, good_pool, bad_pool,
+                        args.fewshot_option, args.max_fewshot, args.reprompt_template, domain,
+                        args.model_name, args.thinking,
+                    )
+                    pairs = [(teacher_messages, y) for y in y_targets]
+                    reprompt_cap = None
                 else:  # student_first == the paper's own SDPO, the baseline
                     _t = time.time()
                     with merged_for_generation(model, bool(args.merge_lora_for_generation)):
@@ -829,46 +973,42 @@ def main() -> None:
                         )
                     timing["teacher_generate"] += time.time() - _t
                     _t = time.time()
-                    y_targets, best_success, scores = select_student_targets(
-                        rollouts, row, domain, bool(args.dont_reprompt_on_self_success)
+                    pairs, sf_info = build_student_first_pairs(
+                        rollouts, row, domain, student_messages, paper_cfg,
+                        bool(args.dont_reprompt_on_self_success),
                     )
                     timing["filter_judge"] += time.time() - _t
-                    all_reward_samples.extend(scores)
+                    all_reward_samples.extend(sf_info["scores"])
+                    ep["n_rollouts_passed"] += sf_info["n_rollouts_passed"]
+                    ep["n_targets_with_solution"] += sf_info["n_targets_with_solution"]
+                    ep["n_targets_with_feedback"] += sf_info["n_targets_with_feedback"]
                     stats = {
-                        "scores": scores,
-                        "n_good": len(y_targets),
-                        "n_bad": len(rollouts) - len(y_targets),
-                        "n_total": len(rollouts),
+                        "scores": sf_info["scores"],
+                        "n_good": sf_info["n_targets"],
+                        "n_bad": sf_info["n_rollouts"] - sf_info["n_targets"],
+                        "n_total": sf_info["n_rollouts"],
                         "mean_sim": 0.0,
                     }
-                    # Path A: a successful sibling rollout becomes the demonstration
-                    # in the teacher's context. Path B (environment feedback) is
-                    # already inside feedback_text. No few-shot exemplar pools here --
-                    # the paper's reprompt template has {solution} and {feedback}
-                    # slots only.
-                    demo_good = [{"code": best_success, "score": 1.0}] if best_success else []
-                    demo_bad = []
-                    if not y_targets:
+                    y_targets = [y for _, y in pairs]
+                    reprompt_cap = paper_cfg["max_reprompt_len"]
+                    if not pairs:
                         continue
 
-                teacher_messages = _build_teacher_messages(
-                    question_content, feedback_text, demo_good, demo_bad,
-                    args.fewshot_option, args.max_fewshot, args.reprompt_template, domain,
-                    args.model_name, args.thinking,
-                )
                 model.train()
                 _t = time.time()
-                if args.teacher_reg == "none" or args.teacher_reg_alpha >= 1.0:
+                if (args.arm == "teacher_first"
+                        and (args.teacher_reg == "none" or args.teacher_reg_alpha >= 1.0)):
                     # Delegate to 09 verbatim -> bit-for-bit parity with the thesis runs.
                     step_loss = teacher_first_step(
                         model, tokenizer, student_messages, teacher_messages,
                         y_targets, optimizer, args.kl_topk, args.kl_alpha, verbose=verbose,
                     )
                 else:
-                    step_loss = teacher_first_step_trust_region(
-                        model, tokenizer, student_messages, teacher_messages,
-                        y_targets, optimizer, args.kl_topk, args.kl_alpha,
-                        args.teacher_reg_alpha, verbose=verbose,
+                    tr_alpha = 1.0 if args.teacher_reg == "none" else args.teacher_reg_alpha
+                    step_loss = distill_step_pairs(
+                        model, tokenizer, student_messages, pairs, optimizer,
+                        args.kl_topk, args.kl_alpha, tr_alpha,
+                        max_reprompt_len=reprompt_cap, verbose=verbose,
                     )
                 timing["grad_step"] += time.time() - _t
                 n_good_here += len(y_targets)
@@ -895,8 +1035,14 @@ def main() -> None:
                 ),
             }
             problem_records.append(rec)
+            greedy_str = "n/a" if greedy_score is None else f"{greedy_score:.2f}"
+            passed_str = ""
+            if args.arm == "student_first" and stats.get("scores"):
+                n_pass = sum(1 for s in stats["scores"] if s >= 1.0)
+                passed_str = f" rollouts_passed={n_pass}/{len(stats['scores'])}"
             print(f"[e{epoch + 1} p{p_idx + 1}/{len(train_rows)}] {problem_id}: {outcome} "
-                  f"greedy={greedy_score:.2f} n_good={n_good_here} loss={step_loss:.4f}")
+                  f"greedy={greedy_str}{passed_str} n_targets={n_good_here} "
+                  f"loss={step_loss:.4f}")
             if use_wandb:
                 wandb.log({f"train/{k}": v for k, v in rec.items() if isinstance(v, (int, float))})
 
@@ -915,6 +1061,10 @@ def main() -> None:
               f"skip_solved={ep['n_skipped_already_solved']} "
               f"skip_no_good={ep['n_skipped_no_good_trajectory']} "
               f"mean_loss={ep['mean_loss']:.4f}")
+        if args.arm == "student_first":
+            print(f"  student-first: rollouts_passed={ep['n_rollouts_passed']} "
+                  f"targets_with_solution(PathA)={ep['n_targets_with_solution']} "
+                  f"targets_with_feedback(PathB)={ep['n_targets_with_feedback']}")
         if use_wandb:
             wandb.log({f"epoch/{k}": v for k, v in ep.items() if isinstance(v, (int, float))})
 
